@@ -1,1 +1,25 @@
+# Secrets
 .env
+
+# Local-only scratch: model research, evaluation notebooks, ad-hoc test scripts.
+# Nothing in here is imported by the service - see local/README.md.
+local/
+
+# Virtualenvs
+test_agent/
+.venv/
+venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Runtime output. logs/ holds per-call latency logs keyed by call id, which are
+# operational data and may carry customer-identifying context.
+logs/
+*.log
+
+# Claude Code. Currently holds only a personal plugin/marketplace list, nothing
+# project-specific. If the team later agrees shared settings, un-ignore
+# .claude/settings.json and keep .claude/settings.local.json ignored.
+.claude/

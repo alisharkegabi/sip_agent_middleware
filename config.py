@@ -54,7 +54,7 @@ class Settings:
 
     # --- Call lifecycle timeouts (F-02) — every long-running loop in
     # CallSession must terminate on one of these even if no SIP/RTP event
-    # ever arrives. This is what makes a dead PBX / dead ElevenLabs endpoint
+    # ever arrives. This is what makes a dead PBX / dead voice-agent endpoint
     # / forever-ringing callee release its thread, port, and RAM instead of
     # leaking until someone Ctrl+C's the process.
     max_ring_seconds: float = field(default_factory=lambda: _env_float("MAX_RING_SECONDS", 45.0))
@@ -71,7 +71,17 @@ class Settings:
     frame_ms: int = 20
     frame_bytes: int = 160  # 8kHz PCMU, 20ms/frame
 
-    # --- ElevenLabs ---
+    # --- Voice agent provider (Stage 0 seam) ---
+    # Selects which VoiceAgent implementation make_voice_agent() builds.
+    # "elevenlabs" is the only provider today and stays the default, so no
+    # existing deployment needs a .env change.
+    voice_agent_provider: str = field(
+        default_factory=lambda: _env_str("VOICE_AGENT_PROVIDER", "elevenlabs")
+    )
+
+    # --- ElevenLabs (consumed only by elevenlabs_agent.py) ---
+    # Names are kept verbatim: AGENT_ID / ELEVENLABS_API_KEY are an existing
+    # .env contract, and renaming them would break running deployments.
     agent_id: str = field(default_factory=lambda: _env_str("AGENT_ID", ""))
     elevenlabs_api_key: str = field(default_factory=lambda: _env_str("ELEVENLABS_API_KEY", ""))
 

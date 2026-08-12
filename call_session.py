@@ -4,9 +4,9 @@ CallSession: everything about ONE call, isolated from every other call.
 Refactor of the original main() control flow, now hardened per
 PRODUCTION_HARDENING_WORK_ORDER.md. Every step — TCP connect, INVITE, 401
 challenge, authenticated re-INVITE, waiting for 200 OK / rejection, ACK, RTP
-bridge bring-up, ElevenLabs conversation start, in-dialog request handling,
+bridge bring-up, voice agent session start, in-dialog request handling,
 BYE/CANCEL, and cleanup — happens on its own thread with its own socket, RTP
-port, SIP dialog identifiers, and ElevenLabs session, same as before.
+port, SIP dialog identifiers, and voice agent session, same as before.
 
 What's new here relative to the original refactor:
   - F-02: every wait loop has a monotonic deadline, not just a hangup flag.
@@ -34,15 +34,13 @@ import time
 import uuid
 from typing import Optional
 
-from elevenlabs.client import ElevenLabs
-from elevenlabs.conversational_ai.conversation import Conversation, ConversationInitiationData
-
 import sip_protocol as sip
 from audio_bridge import RtpAudioInterface
 from config import Settings
 from logging_config import get_call_logger
 from models import CallStatus
 from port_allocator import PortAllocator
+from voice_agent import VoiceAgent, make_voice_agent
 
 
 class CallSession:
@@ -89,7 +87,7 @@ class CallSession:
         self._sock: Optional[socket.socket] = None
         self._stream: Optional[sip.SipStream] = None
         self._rtp_interface: Optional[RtpAudioInterface] = None
-        self._conversation: Optional[Conversation] = None
+        self._agent: Optional[VoiceAgent] = None
 
     # ------------------------------------------------------------------
     # Public control surface (called by CallManager / API layer)
@@ -477,14 +475,11 @@ class CallSession:
         )
 
         # F-09: start RTP transmission (silence frames) immediately, before
-        # the ElevenLabs SDK exists at all -- otherwise there's dead air
+        # the voice agent exists at all -- otherwise there's dead air
         # between ACK and start_session() returning, and many SBCs tear
         # down the call on a media timeout during exactly that gap.
         media_start = time.monotonic()
         self._rtp_interface.start(lambda _pcm: None)
-
-        client = ElevenLabs(api_key=cfg.elevenlabs_api_key)
-        config = ConversationInitiationData(dynamic_variables=self.dynamic_variables)
 
         def on_agent_response(t):
             self._rtp_interface.record_llm_first_text()
@@ -500,24 +495,27 @@ class CallSession:
             if cfg.log_transcripts:
                 self.logger.info(f"Caller: {t}")
 
-        self._conversation = Conversation(
-            client=client,
-            agent_id=cfg.agent_id,
-            requires_auth=bool(cfg.elevenlabs_api_key),
+        # Stage 0 seam: which provider is built comes from
+        # VOICE_AGENT_PROVIDER, and the agent is constructed eagerly right
+        # here -- exactly where the vendor client and session object used to
+        # be built -- so construction errors and the media_start_gap_ms
+        # measurement below keep the timing and failure paths they had.
+        self._agent = make_voice_agent(
+            settings=cfg,
             audio_interface=self._rtp_interface,
-            config=config,
-            callback_agent_response=on_agent_response,
-            callback_user_transcript=on_user_transcript,
+            dynamic_variables=self.dynamic_variables,
+            on_agent_response=on_agent_response,
+            on_user_transcript=on_user_transcript,
         )
 
-        # F-02: watchdog around start_session() -- under network lag to
-        # ElevenLabs (the reported trigger) this call could hang forever.
+        # F-02: watchdog around start_session() -- under network lag to the
+        # provider (the reported trigger) this call could hang forever.
         start_error: list[Exception] = []
         started = threading.Event()
 
         def _start():
             try:
-                self._conversation.start_session()
+                self._agent.start_session()
             except Exception as e:
                 start_error.append(e)
             finally:
@@ -541,7 +539,7 @@ class CallSession:
         def wait_for_end():
             while True:
                 try:
-                    conversation_id = self._conversation.wait_for_session_end()
+                    conversation_id = self._agent.wait_for_session_end()
                     self.conversation_id = conversation_id
                     break
                 except Exception:
@@ -638,8 +636,8 @@ class CallSession:
     def _cleanup(self) -> None:
         self.logger.info("cleaning up call resources")
         try:
-            if self._conversation is not None:
-                self._conversation.end_session()
+            if self._agent is not None:
+                self._agent.end_session()
         except Exception:
             pass
         try:
@@ -655,12 +653,12 @@ class CallSession:
 
         # F-06: this call's record can sit in CallManager's registry for up
         # to CALL_RETENTION_SECONDS after ending. Without this, it keeps
-        # strong references to the ElevenLabs SDK object (with its own
+        # strong references to the voice agent object (with its own
         # threads/buffers), the RTP interface (including any still-queued
         # TTS frames), and the raw socket -- all needed state for the API
         # (last_turn_latency, conversation_id) has already been captured
         # into plain fields on `self`, so it's safe to drop the rest.
-        self._conversation = None
+        self._agent = None
         self._rtp_interface = None
         self._sock = None
         self._stream = None

@@ -20,6 +20,7 @@ from models import (
     HealthResponse,
     ScheduledCall,
 )
+from voice_agent import warm_provider
 
 configure_logging(
     settings.log_level,
@@ -51,6 +52,12 @@ def _rate_limited(client_ip: str) -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Load the voice agent provider before accepting traffic: keeps the SDK
+    # import out of the first call's media gap, and turns a misconfigured
+    # VOICE_AGENT_PROVIDER into a startup failure instead of a failed call.
+    warm_provider(settings)
+    logger.info(f"voice agent provider ready: {settings.voice_agent_provider}")
+
     app.state.call_manager = CallManager(settings)
     logger.info(
         f"call service started (capacity={settings.max_concurrent_calls}, "

@@ -1,5 +1,5 @@
 """
-ElevenLabs <-> RTP audio bridge.
+Voice agent <-> RTP audio bridge.
 
 Per Rule 1 of the work order: the G.711 mu-law <-> PCM16k transcoding,
 audioop.ratecv state handling, 20ms/160-byte framing, RMS VAD threshold
@@ -16,7 +16,7 @@ What changed here (see PRODUCTION_HARDENING_WORK_ORDER.md):
     socket -- explicitly suppressed via SIO_UDP_CONNRESET.
   - F-09: start() is now idempotent so CallSession can start RTP
     transmission (silence frames) immediately after ACK, before the
-    ElevenLabs SDK later calls start() itself from inside start_session().
+    voice agent later calls start() itself from inside start_session().
   - F-10: output() computes the latency numbers under the lock, then
     releases the lock BEFORE doing any file I/O -- the previous code held
     _latency_lock across a blocking open()/write()/close(), which under
@@ -49,7 +49,7 @@ try:
 except ImportError:
     import audioop_lts as audioop  # pip install audioop-lts
 
-from elevenlabs.conversational_ai.conversation import AudioInterface
+from voice_agent import AudioInterface
 
 
 class RtpAudioInterface(AudioInterface):
@@ -170,8 +170,8 @@ class RtpAudioInterface(AudioInterface):
 
     def start(self, input_callback: Callable[[bytes], None]):
         """F-09: idempotent. CallSession calls this immediately after ACK so
-        silence frames flow right away (no dead air while ElevenLabs' own
-        start_session() is still in flight); the SDK's later call to
+        silence frames flow right away (no dead air while the agent's own
+        start_session() is still in flight); the agent's later call to
         start() with the real callback just wires up input_callback without
         spawning duplicate threads."""
         self.input_callback = input_callback
@@ -210,7 +210,7 @@ class RtpAudioInterface(AudioInterface):
     # ---------------------------------------------------
 
     def output(self, audio: bytes):
-        """Receives TTS audio chunks from ElevenLabs."""
+        """Receives TTS audio chunks from the voice agent."""
 
         # --- Latency Instrumentation (compute under lock, write off lock) ---
         log_entry = None
