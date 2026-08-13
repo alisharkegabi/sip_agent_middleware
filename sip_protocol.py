@@ -158,6 +158,39 @@ def build_cancel(
     )
 
 
+def build_refer(
+    *,
+    local_ip: str,
+    local_port: int,
+    pbx_ip: str,
+    target_number: str,
+    ext_user: str,
+    call_id: str,
+    branch: str,
+    from_tag: str,
+    cseq: int,
+    refer_to_extension: str,
+    remote_tag: str = "",
+) -> str:
+    """In-dialog REFER (RFC 3515) asking the PBX to blind-transfer this call
+    to an internal extension. No attended/consultation leg -- Refer-To
+    points straight at the extension on the PBX."""
+    return (
+        f"REFER sip:{target_number}@{pbx_ip} SIP/2.0\r\n"
+        f"Via: SIP/2.0/TCP {local_ip}:{local_port};branch={branch}\r\n"
+        f"Max-Forwards: 70\r\n"
+        f"From: \"{ext_user}\" <sip:{ext_user}@{pbx_ip}>;tag={from_tag}\r\n"
+        f"To: <sip:{target_number}@{pbx_ip}>{remote_tag}\r\n"
+        f"Call-ID: {call_id}\r\n"
+        f"CSeq: {cseq} REFER\r\n"
+        f"Refer-To: <sip:{refer_to_extension}@{pbx_ip}>\r\n"
+        f"Referred-By: <sip:{ext_user}@{pbx_ip}>\r\n"
+        f"Contact: <sip:{ext_user}@{local_ip}:{local_port};transport=tcp>\r\n"
+        f"Content-Length: 0\r\n"
+        f"\r\n"
+    )
+
+
 def build_ok_response(request_text: str, *, sdp: Optional[str] = None, to_tag: str = "") -> str:
     """Build a 200 OK for an in-dialog request (BYE/OPTIONS/INFO/NOTIFY/
     re-INVITE ack, etc). F-26 fix: previously, a missing header emitted the

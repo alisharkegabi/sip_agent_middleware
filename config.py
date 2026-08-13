@@ -64,6 +64,20 @@ class Settings:
     max_auth_attempts: int = field(default_factory=lambda: _env_int("MAX_AUTH_ATTEMPTS", 2))
     cancel_wait_seconds: float = field(default_factory=lambda: _env_float("CANCEL_WAIT_SECONDS", 5.0))
 
+    # --- Call transfer (SIP REFER to an internal extension) ---
+    # CSV of extensions the agent may blind-transfer a call to, e.g. "201,202,203".
+    transfer_extensions: str = field(default_factory=lambda: _env_str("TRANSFER_EXTENSIONS", ""))
+    transfer_wait_seconds: float = field(default_factory=lambda: _env_float("TRANSFER_WAIT_SECONDS", 15.0))
+    transfer_extension_cooldown_seconds: float = field(
+        default_factory=lambda: _env_float("TRANSFER_EXTENSION_COOLDOWN_SECONDS", 2.0)
+    )
+    # How long a successfully-transferred extension is assumed busy before
+    # it's eligible again -- see extension_pool.py's caveat about no real
+    # presence signal from the PBX.
+    transfer_extension_busy_seconds: float = field(
+        default_factory=lambda: _env_float("TRANSFER_EXTENSION_BUSY_SECONDS", 300.0)
+    )
+
     # --- RTP ---
     rtp_port_min: int = field(default_factory=lambda: _env_int("RTP_PORT_MIN", 10000))
     rtp_port_max: int = field(default_factory=lambda: _env_int("RTP_PORT_MAX", 10999))
