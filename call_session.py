@@ -27,22 +27,37 @@ locked, and log files, which are per-call.
 """
 from __future__ import annotations
 
+import queue
 import re
 import socket
 import threading
 import time
 import uuid
+from dataclasses import dataclass, field
 from typing import Optional
 
 from elevenlabs.client import ElevenLabs
-from elevenlabs.conversational_ai.conversation import Conversation, ConversationInitiationData
+from elevenlabs.conversational_ai.conversation import ClientTools, Conversation, ConversationInitiationData
 
 import sip_protocol as sip
 from audio_bridge import RtpAudioInterface
 from config import Settings
+from extension_pool import ExtensionPool, ExtensionPoolExhausted
 from logging_config import get_call_logger
 from models import CallStatus
 from port_allocator import PortAllocator
+
+
+@dataclass
+class _TransferRequest:
+    """Handoff between the ElevenLabs ClientTools executor thread (which
+    calls CallSession._handle_transfer_tool_call) and the SIP thread running
+    _bridge()'s loop -- the only thread allowed to touch self._sock /
+    self._stream. The tool-call thread blocks on result_event; the bridge
+    loop picks the request off the queue, does the REFER, and sets it."""
+    extension: str
+    result_event: threading.Event = field(default_factory=threading.Event)
+    result: Optional[dict] = None
 
 
 class CallSession:
@@ -53,6 +68,7 @@ class CallSession:
         dynamic_variables: dict,
         settings: Settings,
         port_allocator: PortAllocator,
+        extension_pool: Optional[ExtensionPool] = None,
         tracking_id: Optional[str] = None,
     ):
         self.call_id = uuid.uuid4().hex  # our internal id, exposed via the API
@@ -61,8 +77,11 @@ class CallSession:
         self.tracking_id = tracking_id or dynamic_variables.get("tracking_id")
         self.settings = settings
         self._port_allocator = port_allocator
+        self._extension_pool = extension_pool
         self.logger = get_call_logger(self.call_id)
         self.conversation_id = None
+        self.transferred_to: Optional[str] = None
+        self._transfer_requests: "queue.Queue[_TransferRequest]" = queue.Queue()
 
         # Stable for the whole dialog (RFC 3261): Call-ID and From tag.
         self._sip_call_id = f"{uuid.uuid4()}@{settings.local_ip}"
@@ -125,6 +144,7 @@ class CallSession:
                 "exit_reason": self.exit_reason,
                 "answered": self.answered,
                 "talk_seconds": talk_seconds,
+                "transferred_to": self.transferred_to,
             }
 
     def to_webhook_payload(self) -> dict:
@@ -154,6 +174,7 @@ class CallSession:
                     "last_turn_latency": self.last_turn_latency,
                     "answered": self.answered,
                     "dynamic_variables": self.dynamic_variables,
+                    "transferred_to": self.transferred_to,
                 },
             }
 
@@ -442,6 +463,187 @@ class CallSession:
         except Exception:
             self.logger.exception("error sending CANCEL")
 
+    # ------------------------------------------------------------------
+    # Call transfer (SIP REFER to an internal extension)
+    # ------------------------------------------------------------------
+    def _handle_transfer_tool_call(self, parameters: dict) -> dict:
+        """ElevenLabs client tool "transfer_call". Runs on ClientTools' own
+        executor thread, not the SIP thread -- it only picks an extension
+        from the pool and hands the actual REFER off to _bridge()'s loop via
+        self._transfer_requests, then blocks for the outcome. The dict
+        returned here becomes the client_tool_result the agent sees, so it
+        can tell the caller what happened (including "all lines are
+        currently busy" when the pool is exhausted)."""
+        if self._extension_pool is None:
+            return {
+                "success": False,
+                "status": "unavailable",
+                "message": "Call transfer is not configured on this line.",
+            }
+
+        try:
+            extension = self._extension_pool.acquire()
+        except ExtensionPoolExhausted:
+            self.logger.info("transfer requested but no extensions are available")
+            return {
+                "success": False,
+                "status": "busy",
+                "message": "All lines are currently busy.",
+            }
+
+        request = _TransferRequest(extension=extension)
+        self._transfer_requests.put(request)
+
+        # A little slack over transfer_wait_seconds so a normal timeout
+        # inside _perform_transfer always wins the race and produces a
+        # proper result dict instead of this fallback firing first.
+        if not request.result_event.wait(timeout=self.settings.transfer_wait_seconds + 5.0):
+            self._extension_pool.release(extension)
+            self.logger.warning(f"transfer to extension {extension} never picked up by the bridge loop")
+            return {
+                "success": False,
+                "status": "error",
+                "message": "Transfer could not be started; the call may already be ending.",
+            }
+
+        return request.result
+
+    def _perform_transfer(
+        self, request: "_TransferRequest", *, dialog_kwargs: dict, remote_tag: str, cseq: int
+    ) -> tuple[int, bool]:
+        """Runs on the SIP thread, inside _bridge()'s loop. Sends the
+        in-dialog REFER, then handles subsequent SIP traffic itself
+        (matching the REFER's own CSeq, answering the transfer-progress
+        NOTIFY(s)) until a final outcome or timeout, and reports it back to
+        the waiting ClientTools thread. Returns (next_cseq, transferred)."""
+        cfg = self.settings
+        cseq += 1
+        refer_branch = sip.new_branch()
+        self.logger.info(f"transferring call to extension {request.extension} via SIP REFER")
+
+        try:
+            self._sock.sendall(
+                sip.build_refer(
+                    **dialog_kwargs,
+                    branch=refer_branch,
+                    cseq=cseq,
+                    refer_to_extension=request.extension,
+                    remote_tag=remote_tag,
+                ).encode()
+            )
+        except Exception as e:
+            self._extension_pool.release(request.extension)
+            request.result = {
+                "success": False,
+                "status": "error",
+                "message": f"Failed to send transfer request: {e}",
+            }
+            request.result_event.set()
+            return cseq, False
+
+        deadline = time.monotonic() + cfg.transfer_wait_seconds
+        refer_accepted = False
+        outcome: Optional[str] = None  # "success" | "failed" | None (== timeout)
+
+        while time.monotonic() < deadline:
+            frame = self._stream.read_message(max(deadline - time.monotonic(), 0.1))
+            if frame.kind == sip.FrameKind.CLOSED:
+                outcome = "failed"
+                break
+            if frame.kind == sip.FrameKind.TIMEOUT:
+                continue
+
+            msg = frame.text or ""
+            first_line = msg.splitlines()[0] if msg else ""
+
+            if not refer_accepted:
+                parsed = sip.parse_status_line(msg)
+                if parsed is not None:
+                    code, _ = parsed
+                    cseq_match = re.search(r"CSeq:\s*(\d+)\s+REFER", msg, re.IGNORECASE)
+                    if cseq_match and int(cseq_match.group(1)) == cseq:
+                        if 200 <= code < 300:
+                            refer_accepted = True
+                            self.logger.info(f"REFER accepted ({code}), waiting for transfer outcome")
+                        else:
+                            outcome = "failed"
+                            self.logger.info(f"REFER rejected: {first_line}")
+                            break
+                    continue
+
+            method = sip.parse_method(msg)
+            if method == "NOTIFY" and "refer" in msg.lower():
+                try:
+                    self._sock.sendall(sip.build_ok_response(msg).encode())
+                except Exception:
+                    pass
+                body = msg.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in msg else ""
+                frag = sip.parse_status_line(body.strip())
+                if frag is None:
+                    continue
+                frag_code, _ = frag
+                if frag_code == 100:
+                    continue  # trying -- keep waiting for the final fragment
+                outcome = "success" if 200 <= frag_code < 300 else "failed"
+                break
+            elif method == "BYE":
+                # PBX tore down our leg itself as part of completing the
+                # transfer -- ACK it and treat this as success; no BYE of
+                # our own is needed below.
+                try:
+                    self._sock.sendall(sip.build_ok_response(msg).encode())
+                except Exception:
+                    pass
+                self._extension_pool.release(request.extension, busy_seconds=cfg.transfer_extension_busy_seconds)
+                self.transferred_to = request.extension
+                request.result = {
+                    "success": True,
+                    "status": "transferred",
+                    "message": f"Call transferred to extension {request.extension}.",
+                }
+                request.result_event.set()
+                return cseq, True
+            elif method in ("OPTIONS", "INFO", "UPDATE"):
+                try:
+                    self._sock.sendall(sip.build_ok_response(msg).encode())
+                except Exception:
+                    pass
+                continue
+            # anything else in-dialog: ignore, keep waiting for the outcome
+
+        if outcome is None:
+            outcome = "failed"
+            self.logger.info(f"transfer to extension {request.extension} timed out")
+
+        if outcome == "success":
+            self.logger.info(f"call transferred to extension {request.extension}, ending our leg")
+            self._extension_pool.release(request.extension, busy_seconds=cfg.transfer_extension_busy_seconds)
+            self.transferred_to = request.extension
+            try:
+                bye_branch = sip.new_branch()
+                cseq += 1
+                self._sock.sendall(
+                    sip.build_bye(**dialog_kwargs, branch=bye_branch, cseq=cseq, remote_tag=remote_tag).encode()
+                )
+            except Exception:
+                pass
+            request.result = {
+                "success": True,
+                "status": "transferred",
+                "message": f"Call transferred to extension {request.extension}.",
+            }
+            request.result_event.set()
+            return cseq, True
+
+        self._extension_pool.release(request.extension)
+        request.result = {
+            "success": False,
+            "status": "failed",
+            "message": f"Transfer to extension {request.extension} failed.",
+        }
+        request.result_event.set()
+        return cseq, False
+
     @staticmethod
     def _parse_sdp_media_address(sdp_text: str) -> Optional[str]:
         """F-12: prefer a media-level c= line (appears after m=audio) over
@@ -486,6 +688,15 @@ class CallSession:
         client = ElevenLabs(api_key=cfg.elevenlabs_api_key)
         config = ConversationInitiationData(dynamic_variables=self.dynamic_variables)
 
+        # Registers "transfer_call" as an ElevenLabs client tool (must also
+        # be added as a client-tool in the agent's ElevenLabs configuration
+        # for the agent to be able to invoke it). Runs on ClientTools' own
+        # executor thread, so the actual SIP REFER is handed off to the
+        # _bridge() loop below via self._transfer_requests -- see
+        # _handle_transfer_tool_call / _perform_transfer.
+        client_tools = ClientTools()
+        client_tools.register("transfer_call", self._handle_transfer_tool_call)
+
         def on_agent_response(t):
             self._rtp_interface.record_llm_first_text()
             if cfg.log_transcripts:
@@ -506,6 +717,7 @@ class CallSession:
             requires_auth=bool(cfg.elevenlabs_api_key),
             audio_interface=self._rtp_interface,
             config=config,
+            client_tools=client_tools,
             callback_agent_response=on_agent_response,
             callback_user_transcript=on_user_transcript,
         )
@@ -569,6 +781,20 @@ class CallSession:
                 exit_reason = "rtp_timeout"
                 break
 
+            try:
+                transfer_request = self._transfer_requests.get_nowait()
+            except queue.Empty:
+                transfer_request = None
+
+            if transfer_request is not None:
+                cseq, transferred = self._perform_transfer(
+                    transfer_request, dialog_kwargs=dialog_kwargs, remote_tag=remote_tag, cseq=cseq
+                )
+                if transferred:
+                    exit_reason = "transferred"
+                    break
+                continue
+
             frame = self._stream.read_message(cfg.sip_bridge_poll_timeout)
             if frame.kind == sip.FrameKind.CLOSED:
                 self.logger.info("SIP pipe disconnected abruptly")
@@ -620,7 +846,7 @@ class CallSession:
         if self._hangup_requested.is_set() and exit_reason == "unknown":
             exit_reason = "local_hangup"
 
-        if self._hangup_requested.is_set() or exit_reason in ("max_duration", "rtp_timeout", "local_hangup"):
+        if self._hangup_requested.is_set() or exit_reason in ("max_duration", "rtp_timeout", "local_hangup","agent_ended"):
             self.logger.info(f"ending call (reason={exit_reason}), sending BYE")
             try:
                 bye_branch = sip.new_branch()  # F-14: BYE is its own transaction
@@ -630,7 +856,11 @@ class CallSession:
             except Exception:
                 pass
 
-        status = CallStatus.COMPLETED if exit_reason in ("remote_bye", "agent_ended", "local_hangup") else CallStatus.FAILED
+        status = (
+            CallStatus.COMPLETED
+            if exit_reason in ("remote_bye", "agent_ended", "local_hangup", "transferred")
+            else CallStatus.FAILED
+        )
         self._set_status(status)
         return exit_reason
 

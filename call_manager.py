@@ -39,6 +39,7 @@ from typing import Optional
 
 from call_session import CallSession
 from config import Settings
+from extension_pool import ExtensionPool
 from logging_config import get_logger, _DroppingQueueHandler
 from models import CallStatus
 from port_allocator import PortAllocator
@@ -62,6 +63,10 @@ class CallManager:
         )
         self._port_allocator = PortAllocator(
             settings.rtp_port_min, settings.rtp_port_max, settings.rtp_port_cooldown_seconds
+        )
+        transfer_extensions = [e.strip() for e in settings.transfer_extensions.split(",") if e.strip()]
+        self._extension_pool = ExtensionPool(
+            transfer_extensions, cooldown_seconds=settings.transfer_extension_cooldown_seconds
         )
         self._webhook_sender = WebhookSender(settings)
         self._sessions: dict[str, CallSession] = {}
@@ -102,6 +107,7 @@ class CallManager:
             dynamic_variables=dynamic_variables,
             settings=self.settings,
             port_allocator=self._port_allocator,
+            extension_pool=self._extension_pool,
             tracking_id=tracking_id,
         )
         with self._lock:
@@ -176,6 +182,7 @@ class CallManager:
                     oldest_queued = max(0.0, time.time() - min(s.queued_at for s in queued_sessions))
 
         port_stats = self._port_allocator.stats()
+        extension_stats = self._extension_pool.stats()
         return {
             "status": "ok" if not self._shutdown_event.is_set() else "shutting_down",
             "active_calls": active,
@@ -186,6 +193,8 @@ class CallManager:
             "total_failed": total_failed,
             "rtp_ports_free": port_stats["free"],
             "rtp_ports_in_use": port_stats["in_use"],
+            "transfer_extensions_free": extension_stats["free"],
+            "transfer_extensions_in_use": extension_stats["in_use"],
             "uptime_seconds": time.time() - self._started_at,
             "queue_depth": queued,
             "oldest_queued_seconds": oldest_queued,

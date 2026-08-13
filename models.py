@@ -88,6 +88,7 @@ class CallDetail(BaseModel):
     exit_reason: Optional[str] = None
     answered: bool = False
     talk_seconds: Optional[float] = None
+    transferred_to: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -100,6 +101,8 @@ class HealthResponse(BaseModel):
     total_failed: int
     rtp_ports_free: int
     rtp_ports_in_use: int
+    transfer_extensions_free: int = 0
+    transfer_extensions_in_use: int = 0
     uptime_seconds: float
     # F-19 observability
     queue_depth: int = 0
