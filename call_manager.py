@@ -162,6 +162,26 @@ class CallManager:
         session.request_hangup()
         return True
 
+    def get_call_by_tracking_id(self, tracking_id: str) -> Optional[CallSession]:
+        """tracking_id is caller-supplied (dynamic_variables) and is what
+        ElevenLabs already has on hand mid-call, unlike our internal
+        call_id. Not guaranteed unique across the process lifetime (e.g. a
+        retried batch could reuse one) -- prefer the most recently created
+        matching session, since that's the one still plausibly in-flight."""
+        with self._lock:
+            candidates = [s for s in self._sessions.values() if s.tracking_id == tracking_id]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda s: s.created_at)
+
+    def transfer_by_tracking_id(self, tracking_id: str) -> Optional[dict]:
+        """Blocks until the transfer resolves or times out -- call off the
+        event loop (see main.py's use of run_in_threadpool)."""
+        session = self.get_call_by_tracking_id(tracking_id)
+        if session is None:
+            return None
+        return session.request_transfer()
+
     # ------------------------------------------------------------------
     def health(self) -> dict:
         with self._lock:

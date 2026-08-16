@@ -1,3 +1,5 @@
 .env
-venv\
+venv/
 sqlservertest.py
+logs/
+__pycache__/
