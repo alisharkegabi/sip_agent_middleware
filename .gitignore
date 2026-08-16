@@ -3,3 +3,7 @@ venv/
 sqlservertest.py
 logs/
 __pycache__/
+claude_files/
+local/
+claude.md
+.claude/
