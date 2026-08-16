@@ -10,6 +10,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
+from arabic_numbers import enrich_dynamic_variables
 from call_manager import CallManager, QueueFullError
 from config import settings
 from logging_config import configure_logging, get_logger, stop_logging
@@ -178,6 +179,13 @@ async def create_calls(payload: CallsRequest):
         import json as _json  # local import: only needed for this size check
         if len(_json.dumps(dynamic_variables)) > settings.max_dynamic_variables_bytes:
             raise HTTPException(status_code=400, detail="dynamic_variables payload too large")
+
+        # Pre-compute Egyptian-Arabic spoken forms (amounts, dates, years,
+        # DAY0/1/2) once here instead of the ElevenLabs agent running the
+        # KB:NUMBERS conversion live on every turn that mentions a number.
+        # Size/key-count validation above runs on the caller's original
+        # payload, not this enriched copy.
+        dynamic_variables = enrich_dynamic_variables(dynamic_variables, logger=logger)
 
         try:
             session = manager.submit_call(

@@ -3,3 +3,4 @@ venv/
 sqlservertest.py
 logs/
 __pycache__/
+*.md
