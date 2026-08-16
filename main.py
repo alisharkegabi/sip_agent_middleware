@@ -179,6 +179,20 @@ async def create_calls(payload: CallsRequest):
         if len(_json.dumps(dynamic_variables)) > settings.max_dynamic_variables_bytes:
             raise HTTPException(status_code=400, detail="dynamic_variables payload too large")
 
+        # The agent's callTransferInt webhook tool carries tracking_id as a URL
+        # path param (POST .../calls/by-tracking-id/{tracking_id}/transfer), so
+        # ElevenLabs treats it as required and closes the socket with 1008
+        # "Missing required dynamic variables in tools" when it is absent --
+        # but only AFTER the call has connected and the greeting has played,
+        # burning a real customer call on a payload bug. Reject before dialling.
+        # It is also the BatchCallDetails key, so a call without one is
+        # untracked even if it succeeds.
+        if not str(dynamic_variables.get("tracking_id") or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="dynamic_variables.tracking_id is required",
+            )
+
         try:
             session = manager.submit_call(
                 phone_number=recipient.phone_number,
