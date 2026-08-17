@@ -7,3 +7,4 @@ claude_files/
 local/
 claude.md
 .claude/
+*.md
