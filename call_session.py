@@ -747,6 +747,10 @@ class CallSession:
             frame_bytes=cfg.frame_bytes,
             log_dir=cfg.log_dir,
             on_turn_latency=_on_turn_latency,
+            antialias=cfg.audio_antialias,
+            antialias_cutoff_hz=cfg.audio_antialias_cutoff_hz,
+            antiimage=cfg.audio_antiimage,
+            antiimage_cutoff_hz=cfg.audio_antiimage_cutoff_hz,
             logger=self.logger,
         )
 
