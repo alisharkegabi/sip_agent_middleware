@@ -89,6 +89,11 @@ class CallDetail(BaseModel):
     answered: bool = False
     talk_seconds: Optional[float] = None
     transferred_to: Optional[str] = None
+    # ElevenLabs post-call analysis (evaluation_criteria_results,
+    # data_collection_results, transcript_summary, ...). None until the
+    # analysis has been fetched -- a few seconds after the call ends -- and
+    # always None if FETCH_CONVERSATION_ANALYSIS is off.
+    analysis: Optional[dict] = None
 
 
 class HealthResponse(BaseModel):
