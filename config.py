@@ -85,6 +85,25 @@ class Settings:
     frame_ms: int = 20
     frame_bytes: int = 160  # 8kHz PCMU, 20ms/frame
 
+    # Anti-alias low-pass on the outbound (agent -> caller) leg. audioop.ratecv
+    # does not filter, so without this everything the agent produces above
+    # 4 kHz folds back into the speech band -- measured at 23.4 dB SNR against
+    # a filtered reference. Flagged so it can be A/B'd against real calls;
+    # AUDIO_ANTIALIAS=false restores the previous behaviour exactly.
+    audio_antialias: bool = field(default_factory=lambda: _env_bool("AUDIO_ANTIALIAS", True))
+    audio_antialias_cutoff_hz: float = field(
+        default_factory=lambda: _env_float("AUDIO_ANTIALIAS_CUTOFF_HZ", 3400.0)
+    )
+
+    # The mirror of the above on the inbound (caller -> agent) leg. ratecv's
+    # linear interpolation leaves spectral images above 4 kHz in what STT
+    # hears -- rejected by only 4.1 dB at 3400 Hz -- and droops the passband
+    # by 3.1 dB at 3000 Hz. AUDIO_ANTIIMAGE=false restores the old path.
+    audio_antiimage: bool = field(default_factory=lambda: _env_bool("AUDIO_ANTIIMAGE", True))
+    audio_antiimage_cutoff_hz: float = field(
+        default_factory=lambda: _env_float("AUDIO_ANTIIMAGE_CUTOFF_HZ", 3600.0)
+    )
+
     # --- ElevenLabs ---
     agent_id: str = field(default_factory=lambda: _env_str("AGENT_ID", ""))
     elevenlabs_api_key: str = field(default_factory=lambda: _env_str("ELEVENLABS_API_KEY", ""))
