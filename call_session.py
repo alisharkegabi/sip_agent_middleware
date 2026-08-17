@@ -81,6 +81,9 @@ class CallSession:
         self._extension_pool = extension_pool
         self.logger = get_call_logger(self.call_id)
         self.conversation_id = None
+        # Filled in after the call by AnalysisFetcher (evaluation criteria +
+        # data collection results). None until ElevenLabs finishes analysing.
+        self.analysis: Optional[dict] = None
         self.transferred_to: Optional[str] = None
         self._transfer_requests: "queue.Queue[_TransferRequest]" = queue.Queue()
 
@@ -138,6 +141,13 @@ class CallSession:
         off the event loop."""
         return self._handle_transfer_tool_call({})
 
+    def set_analysis(self, analysis: dict) -> None:
+        """Called from an analysis-fetch thread once ElevenLabs' post-call
+        record is available; guarded like every other cross-thread write to
+        session state (F-24)."""
+        with self._status_lock:
+            self.analysis = analysis
+
     def _set_status(self, status: CallStatus, error: Optional[str] = None) -> None:
         with self._status_lock:
             self.status = status
@@ -167,13 +177,22 @@ class CallSession:
                 "answered": self.answered,
                 "talk_seconds": talk_seconds,
                 "transferred_to": self.transferred_to,
+                "analysis": self.analysis,
             }
 
-    def to_webhook_payload(self) -> dict:
+    def to_webhook_payload(self, event: str = "call_status") -> dict:
         """Terminal-state notification payload sent to the configured webhook.
 
         Reuses the same fields as to_dict()/CallDetail -- no new state is
         introduced, this is just a different shape for external consumers.
+
+        Sent twice per call when post-call analysis is enabled:
+          - event="call_status"   immediately at terminal status, analysis=null
+          - event="call_analysis" seconds later, once ElevenLabs has produced
+                                  the evaluation/data-collection results
+        Everything except `event` and `analysis` is identical between the
+        two, so a consumer that only cares about completion can keep
+        processing the first one exactly as before and ignore the second.
         """
         with self._status_lock:
             started_at = self.dialed_at if self.dialed_at is not None else self.created_at
@@ -181,6 +200,7 @@ class CallSession:
             if self.ended_at is not None and started_at is not None:
                 duration_seconds = round(self.ended_at - started_at, 3)
             return {
+                "event": event,
                 "call_id": self.call_id,
                 "conversation_id": self.conversation_id,
                 "status": self.status.value,
@@ -188,6 +208,7 @@ class CallSession:
                 "ended_at": self.ended_at,
                 "duration_seconds": duration_seconds,
                 "reason": self.exit_reason or self.error or self.status.value,
+                "analysis": self.analysis,
                 "metadata": {
                     "phone_number": self.phone_number,
                     "tracking_id": self.tracking_id,

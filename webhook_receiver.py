@@ -45,6 +45,10 @@ app = FastAPI(
 
 
 class CallStatusWebhook(BaseModel):
+    # "call_status" (sent at terminal status) or "call_analysis" (sent once
+    # ElevenLabs' post-call analysis is available). Defaults to call_status
+    # so payloads from an older build still validate.
+    event: str = "call_status"
     call_id: str
     conversation_id: Optional[str] = None
     status: str
@@ -52,6 +56,7 @@ class CallStatusWebhook(BaseModel):
     ended_at: Optional[float] = None
     duration_seconds: Optional[float] = None
     reason: Optional[str] = None
+    analysis: Optional[dict[str, Any]] = None
     metadata: dict[str, Any] = {}
 
 
@@ -132,13 +137,16 @@ def _log_webhook(payload: dict) -> None:
     function so it can be swapped for structured logging (e.g. the
     logging_config module's logger, or a metrics/alerting sink) in
     production without touching the endpoint logic.
+
+    Prints the raw body rather than the validated model so that fields this
+    receiver doesn't model yet are still visible.
     """
     timestamp = datetime.now(timezone.utc).isoformat()
     print("=" * 42)
-    print("Webhook Received")
+    print(f"Webhook Received  [{payload.get('event', 'call_status')}]")
     print(f"Time: {timestamp}")
     print()
-    print(json.dumps(payload, indent=2, default=str))
+    print(json.dumps(payload, indent=2, default=str, ensure_ascii=False))
     print()
     print("Webhook processed successfully.")
     print("=" * 42)
@@ -157,13 +165,13 @@ async def receive_call_status(request: Request):
         return JSONResponse(status_code=422, content={"detail": e.errors()})
 
     try:
-        _log_webhook(webhook.model_dump())
+        _log_webhook(raw_body)
     except Exception as e:
         # Logging must never fail the request -- the sender already
         # succeeded in delivering the payload at this point.
         print(f"warning: failed to log webhook payload: {e}")
 
-    return {"received": True, "call_id": webhook.call_id}
+    return {"received": True, "call_id": webhook.call_id, "event": webhook.event}
 
 
 @app.exception_handler(Exception)

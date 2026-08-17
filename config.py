@@ -89,6 +89,30 @@ class Settings:
     agent_id: str = field(default_factory=lambda: _env_str("AGENT_ID", ""))
     elevenlabs_api_key: str = field(default_factory=lambda: _env_str("ELEVENLABS_API_KEY", ""))
 
+    # --- Post-call conversation analysis (conversation_analysis.py) ---
+    # After a call ends, fetch the ElevenLabs conversation record so the
+    # evaluation-criteria results and data-collection fields (e.g.
+    # "PaymentDate") reach the .NET client. ElevenLabs computes these
+    # asynchronously, hence the poll.
+    fetch_conversation_analysis: bool = field(
+        default_factory=lambda: _env_bool("FETCH_CONVERSATION_ANALYSIS", True)
+    )
+    analysis_poll_interval_seconds: float = field(
+        default_factory=lambda: _env_float("ANALYSIS_POLL_INTERVAL_SECONDS", 3.0)
+    )
+    analysis_max_wait_seconds: float = field(
+        default_factory=lambda: _env_float("ANALYSIS_MAX_WAIT_SECONDS", 90.0)
+    )
+    analysis_request_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("ANALYSIS_REQUEST_TIMEOUT_SECONDS", 15.0)
+    )
+    # Dump the COMPLETE conversation record (including the turn-by-turn
+    # transcript -- real customer speech) to logs/conversations/*.json.
+    # Off by default; enable for debugging/verification only.
+    log_conversation_json: bool = field(
+        default_factory=lambda: _env_bool("LOG_CONVERSATION_JSON", False)
+    )
+
     # --- Concurrency / capacity ---
     # F-29: the stated requirement is 30 concurrent calls on 4 vCPU. 50 was
     # an untested default; keep 30 as the production default and only raise

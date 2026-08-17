@@ -83,6 +83,70 @@ See `.env.example` for the full list with defaults and comments. Copy it to
 `.env` and fill in real values — **`API_SHARED_SECRET` and `EXT_PASS` in
 particular must not ship with placeholder values.**
 
+## Post-call analysis from ElevenLabs (evaluation criteria + data collection)
+
+After a call ends, ElevenLabs asynchronously produces a conversation record
+containing the agent's **evaluation criteria results** and **data collection
+results** — the fields defined in the agent's *Analysis* tab, e.g.
+`PaymentDate`. `conversation_analysis.py` fetches that record
+(`GET /v1/convai/conversations/{id}`, via the SDK already in the process) and
+hands it to the client. No public endpoint or webhook signature verification
+is needed, unlike ElevenLabs' own post-call webhook.
+
+The client now receives **two** notifications per call, identical except for
+`event` and `analysis`:
+
+| `event` | when | `analysis` |
+|---|---|---|
+| `call_status` | immediately at terminal status, exactly as before | `null` |
+| `call_analysis` | once ElevenLabs has finished analysing (seconds later) | populated |
+
+A consumer that only cares about completion keeps handling the first message
+unchanged and can ignore the second. `GET /calls/{id}` also carries `analysis`
+once it lands.
+
+```json
+"analysis": {
+  "conversation_id": "conv_...",
+  "status": "done",
+  "branch_id": "agtbrch_...",
+  "call_successful": "success",
+  "transcript_summary": "...",
+  "evaluation_criteria_results": { "<criterion>": { "result": "success", "rationale": "..." } },
+  "data_collection_results": { "PaymentDate": { "value": "2026-08-20", "rationale": "...", "type": "string" } },
+  "data_collection": { "PaymentDate": "2026-08-20" }
+}
+```
+
+`data_collection_results` contains **only fields configured on the agent** —
+if `PaymentDate` is not defined in the agent's Analysis → Data collection
+settings, it will not appear here no matter what was said on the call.
+
+Configuration:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `FETCH_CONVERSATION_ANALYSIS` | `true` | Master switch |
+| `ANALYSIS_POLL_INTERVAL_SECONDS` | `3.0` | Gap between readiness polls |
+| `ANALYSIS_MAX_WAIT_SECONDS` | `90.0` | Give up after this; no second webhook is sent |
+| `ANALYSIS_REQUEST_TIMEOUT_SECONDS` | `15.0` | Per-request HTTP timeout |
+| `LOG_CONVERSATION_JSON` | `false` | Dump the **complete** record, transcript included, to `logs/conversations/<call_id>_<conversation_id>.json` |
+
+`LOG_CONVERSATION_JSON` writes real customer speech to disk — keep it off in
+production and use it only for verification. The transcript is never included
+in the webhook payload or in `GET /calls/{id}`.
+
+`fetch_conversation.py` prints the same record on demand for one conversation:
+
+```
+python fetch_conversation.py --latest --summary
+python fetch_conversation.py conv_01k...
+```
+
+Threading follows the F-18 rule: polling is rescheduled on `threading.Timer`,
+so no pool thread ever sleeps waiting for ElevenLabs, and the fetcher has its
+own executor separate from both call workers and webhook delivery.
+
 ## Running it in production (Windows Server 2019+, per your prerequisites doc)
 
 This is the section that actually eliminates the Ctrl+C ritual — the code
