@@ -83,6 +83,10 @@ See `.env.example` for the full list with defaults and comments. Copy it to
 `.env` and fill in real values — **`API_SHARED_SECRET` and `EXT_PASS` in
 particular must not ship with placeholder values.**
 
+Internal call transfer (SIP REFER, triggered when the agent says
+`هيتم تحويل المكالمة دلوقتي`, with a static "all lines busy" fallback) is a
+separate feature — see `TRANSFER_FEATURE.md` and `CALL_STATUS_TRACKING.md`.
+
 ## Post-call analysis from ElevenLabs (evaluation criteria + data collection)
 
 After a call ends, ElevenLabs asynchronously produces a conversation record

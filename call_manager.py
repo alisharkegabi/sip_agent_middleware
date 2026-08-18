@@ -44,6 +44,7 @@ from extension_pool import ExtensionPool
 from logging_config import get_logger, _DroppingQueueHandler
 from models import CallStatus
 from port_allocator import PortAllocator
+from static_audio import load_ulaw_frames
 from webhook_client import WebhookSender
 
 logger = get_logger("call_manager")
@@ -69,6 +70,11 @@ class CallManager:
         self._extension_pool = ExtensionPool(
             transfer_extensions, cooldown_seconds=settings.transfer_extension_cooldown_seconds
         )
+        # Loaded once per process (not once per call -- 30 concurrent calls
+        # must not each re-decode/re-filter the same WAV). A missing or
+        # corrupt file is a startup-time log error, not a live-call crash:
+        # the busy path just hangs up silently instead of playing audio.
+        self._busy_frames = self._load_busy_frames(settings)
         self._webhook_sender = WebhookSender(settings)
         self._analysis_fetcher = AnalysisFetcher(settings)
         self._sessions: dict[str, CallSession] = {}
@@ -88,6 +94,19 @@ class CallManager:
             target=self._reap_old_sessions, daemon=True, name="call-reaper"
         )
         self._reaper_thread.start()
+
+    @staticmethod
+    def _load_busy_frames(settings: Settings) -> Optional[list[bytes]]:
+        if not settings.busy_prompt_enabled:
+            return None
+        try:
+            return load_ulaw_frames(settings.busy_prompt_audio_path, frame_bytes=settings.frame_bytes)
+        except Exception:
+            logger.exception(
+                f"failed to load busy-prompt audio from {settings.busy_prompt_audio_path!r}; "
+                "the 'all lines busy' transfer path will hang up silently instead of playing it"
+            )
+            return None
 
     # ------------------------------------------------------------------
     def submit_call(self, *, phone_number: str, dynamic_variables: dict, tracking_id: Optional[str]) -> CallSession:
@@ -111,6 +130,7 @@ class CallManager:
             port_allocator=self._port_allocator,
             extension_pool=self._extension_pool,
             tracking_id=tracking_id,
+            busy_frames=self._busy_frames,
         )
         with self._lock:
             self._sessions[session.call_id] = session
