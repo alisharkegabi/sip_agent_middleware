@@ -90,7 +90,14 @@ class CallManager:
         self._reaper_thread.start()
 
     # ------------------------------------------------------------------
-    def submit_call(self, *, phone_number: str, dynamic_variables: dict, tracking_id: Optional[str]) -> CallSession:
+    def submit_call(
+        self,
+        *,
+        phone_number: str,
+        dynamic_variables: dict,
+        tracking_id: Optional[str],
+        speech_dynamic_variables: Optional[dict] = None,
+    ) -> CallSession:
         if self._shutdown_event.is_set():
             raise RuntimeError("service is shutting down; not accepting new calls")
 
@@ -107,6 +114,7 @@ class CallManager:
         session = CallSession(
             phone_number=phone_number,
             dynamic_variables=dynamic_variables,
+            speech_dynamic_variables=speech_dynamic_variables,
             settings=self.settings,
             port_allocator=self._port_allocator,
             extension_pool=self._extension_pool,

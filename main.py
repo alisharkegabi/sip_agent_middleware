@@ -10,6 +10,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
+import name_normalizer
 from call_manager import CallManager, QueueFullError
 from config import settings
 from logging_config import configure_logging, get_logger, stop_logging
@@ -193,10 +194,41 @@ async def create_calls(payload: CallsRequest):
                 detail="dynamic_variables.tracking_id is required",
             )
 
+        # Arabic name orthography: the source data stores `علي` as `على` (also
+        # the preposition "on"), so the agent says the wrong word. Build the
+        # corrected snapshot HERE, before dialling -- doing it at the
+        # ElevenLabs boundary would put a data-file or value-type error after
+        # the customer has already answered, burning a real call for the same
+        # class of reason the tracking_id check above exists.
+        #
+        # `dynamic_variables` itself is left untouched, so to_webhook_payload()
+        # still echoes the .NET client exactly what it sent.
+        speech_dynamic_variables = dynamic_variables
+        if settings.name_normalization:
+            name_keys = [
+                k.strip() for k in settings.name_normalization_keys.split(",") if k.strip()
+            ]
+            gender_keys = dict(
+                pair.split(":", 1)
+                for pair in (
+                    p.strip() for p in settings.name_normalization_gender_keys.split(",")
+                )
+                if ":" in pair
+            )
+            speech_dynamic_variables, counters = name_normalizer.normalize_dynamic_variables(
+                dynamic_variables, name_keys, gender_keys
+            )
+            if counters:
+                # Rule names and counts only -- names are borrower data.
+                logger.info(
+                    f"name normalization: {name_normalizer.format_counters(counters)}"
+                )
+
         try:
             session = manager.submit_call(
                 phone_number=recipient.phone_number,
                 dynamic_variables=dynamic_variables,
+                speech_dynamic_variables=speech_dynamic_variables,
                 tracking_id=dynamic_variables.get("tracking_id"),
             )
         except QueueFullError as e:

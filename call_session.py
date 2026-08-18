@@ -71,10 +71,19 @@ class CallSession:
         port_allocator: PortAllocator,
         extension_pool: Optional[ExtensionPool] = None,
         tracking_id: Optional[str] = None,
+        speech_dynamic_variables: Optional[dict] = None,
     ):
         self.call_id = uuid.uuid4().hex  # our internal id, exposed via the API
         self.phone_number = phone_number
         self.dynamic_variables = dynamic_variables
+        # Arabic name spellings corrected for TTS (see name_normalizer.py),
+        # built by the API layer BEFORE dialling. Only _bridge() reads it, so
+        # to_webhook_payload() keeps echoing the client's raw payload. Falls
+        # back to the raw dict, which is what every existing caller and test
+        # gets by not passing it.
+        self.speech_dynamic_variables = (
+            speech_dynamic_variables if speech_dynamic_variables is not None else dynamic_variables
+        )
         self.tracking_id = tracking_id or dynamic_variables.get("tracking_id")
         self.settings = settings
         self._port_allocator = port_allocator
@@ -762,7 +771,9 @@ class CallSession:
         self._rtp_interface.start(lambda _pcm: None)
 
         client = ElevenLabs(api_key=cfg.elevenlabs_api_key)
-        config = ConversationInitiationData(dynamic_variables=self.dynamic_variables)
+        # The ONE consumer of the corrected names -- everything else (webhook,
+        # DB, API responses) uses self.dynamic_variables as the client sent it.
+        config = ConversationInitiationData(dynamic_variables=self.speech_dynamic_variables)
 
         # Registers "transfer_call" as an ElevenLabs client tool (must also
         # be added as a client-tool in the agent's ElevenLabs configuration

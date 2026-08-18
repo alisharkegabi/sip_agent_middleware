@@ -179,5 +179,30 @@ class Settings:
     max_dynamic_variables_bytes: int = field(default_factory=lambda: _env_int("MAX_DYNAMIC_VARIABLES_BYTES", 8192))
     max_dynamic_variables_keys: int = field(default_factory=lambda: _env_int("MAX_DYNAMIC_VARIABLES_KEYS", 64))
 
+    # --- Arabic name normalization for TTS ---
+    # The source data stores `علي` (Ali) as `على`, which is also the preposition
+    # "on", so the agent says the wrong word. name_normalizer.py repairs the
+    # spelling of the keys listed below before the call is placed. Only the
+    # ElevenLabs side sees the correction -- the webhook still echoes the raw
+    # payload the client sent. Off restores the previous behaviour exactly.
+    name_normalization: bool = field(default_factory=lambda: _env_bool("NAME_NORMALIZATION", True))
+    name_normalization_keys: str = field(  # CSV, parsed like phone_allow_prefixes
+        default_factory=lambda: _env_str(
+            "NAME_NORMALIZATION_KEYS",
+            "user_name,user_name_full,call_receiver,guarantor_name,guarantor_name_full",
+        )
+    )
+    # CSV of `name_key:gender_key`. A few names are female with a final ى and
+    # male with a final ي (`يسرى` Yosra vs `يسري` Yosri), so the payload's own
+    # gender column decides. Only the first token of a name consults it -- the
+    # tokens after it are the father's and grandfather's names.
+    name_normalization_gender_keys: str = field(
+        default_factory=lambda: _env_str(
+            "NAME_NORMALIZATION_GENDER_KEYS",
+            "user_name:br_gender,user_name_full:br_gender,call_receiver:cr_gender,"
+            "guarantor_name:gr_gender,guarantor_name_full:gr_gender",
+        )
+    )
+
 
 settings = Settings()
