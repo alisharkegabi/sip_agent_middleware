@@ -85,9 +85,52 @@ class Settings:
     frame_ms: int = 20
     frame_bytes: int = 160  # 8kHz PCMU, 20ms/frame
 
+    # Anti-alias low-pass on the outbound (agent -> caller) leg. audioop.ratecv
+    # does not filter, so without this everything the agent produces above
+    # 4 kHz folds back into the speech band -- measured at 23.4 dB SNR against
+    # a filtered reference. Flagged so it can be A/B'd against real calls;
+    # AUDIO_ANTIALIAS=false restores the previous behaviour exactly.
+    audio_antialias: bool = field(default_factory=lambda: _env_bool("AUDIO_ANTIALIAS", True))
+    audio_antialias_cutoff_hz: float = field(
+        default_factory=lambda: _env_float("AUDIO_ANTIALIAS_CUTOFF_HZ", 3400.0)
+    )
+
+    # The mirror of the above on the inbound (caller -> agent) leg. ratecv's
+    # linear interpolation leaves spectral images above 4 kHz in what STT
+    # hears -- rejected by only 4.1 dB at 3400 Hz -- and droops the passband
+    # by 3.1 dB at 3000 Hz. AUDIO_ANTIIMAGE=false restores the old path.
+    audio_antiimage: bool = field(default_factory=lambda: _env_bool("AUDIO_ANTIIMAGE", True))
+    audio_antiimage_cutoff_hz: float = field(
+        default_factory=lambda: _env_float("AUDIO_ANTIIMAGE_CUTOFF_HZ", 3600.0)
+    )
+
     # --- ElevenLabs ---
     agent_id: str = field(default_factory=lambda: _env_str("AGENT_ID", ""))
     elevenlabs_api_key: str = field(default_factory=lambda: _env_str("ELEVENLABS_API_KEY", ""))
+
+    # --- Post-call conversation analysis (conversation_analysis.py) ---
+    # After a call ends, fetch the ElevenLabs conversation record so the
+    # evaluation-criteria results and data-collection fields (e.g.
+    # "PaymentDate") reach the .NET client. ElevenLabs computes these
+    # asynchronously, hence the poll.
+    fetch_conversation_analysis: bool = field(
+        default_factory=lambda: _env_bool("FETCH_CONVERSATION_ANALYSIS", True)
+    )
+    analysis_poll_interval_seconds: float = field(
+        default_factory=lambda: _env_float("ANALYSIS_POLL_INTERVAL_SECONDS", 3.0)
+    )
+    analysis_max_wait_seconds: float = field(
+        default_factory=lambda: _env_float("ANALYSIS_MAX_WAIT_SECONDS", 90.0)
+    )
+    analysis_request_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("ANALYSIS_REQUEST_TIMEOUT_SECONDS", 15.0)
+    )
+    # Dump the COMPLETE conversation record (including the turn-by-turn
+    # transcript -- real customer speech) to logs/conversations/*.json.
+    # Off by default; enable for debugging/verification only.
+    log_conversation_json: bool = field(
+        default_factory=lambda: _env_bool("LOG_CONVERSATION_JSON", False)
+    )
 
     # --- Concurrency / capacity ---
     # F-29: the stated requirement is 30 concurrent calls on 4 vCPU. 50 was

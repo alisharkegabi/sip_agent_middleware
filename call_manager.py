@@ -39,6 +39,7 @@ from typing import Optional
 
 from call_session import CallSession
 from config import Settings
+from conversation_analysis import AnalysisFetcher
 from extension_pool import ExtensionPool
 from logging_config import get_logger, _DroppingQueueHandler
 from models import CallStatus
@@ -69,6 +70,7 @@ class CallManager:
             transfer_extensions, cooldown_seconds=settings.transfer_extension_cooldown_seconds
         )
         self._webhook_sender = WebhookSender(settings)
+        self._analysis_fetcher = AnalysisFetcher(settings)
         self._sessions: dict[str, CallSession] = {}
         self._lock = threading.RLock()
         self._shutdown_event = threading.Event()
@@ -143,6 +145,20 @@ class CallManager:
         # WebhookSender for retry/dead-letter handling.
         self._webhook_sender.send_async(session.to_webhook_payload())
 
+        # Post-call analysis is not available at this instant -- ElevenLabs
+        # is still computing it -- so it gets its own notification rather
+        # than delaying the completion one above. Fire-and-forget; a failure
+        # to fetch never affects the call result already delivered.
+        self._analysis_fetcher.fetch_async(
+            call_id=session.call_id,
+            conversation_id=session.conversation_id,
+            on_result=lambda analysis, s=session: self._on_analysis_ready(s, analysis),
+        )
+
+    def _on_analysis_ready(self, session: CallSession, analysis: dict) -> None:
+        session.set_analysis(analysis)
+        self._webhook_sender.send_async(session.to_webhook_payload(event="call_analysis"))
+
     # ------------------------------------------------------------------
     def get_call(self, call_id: str) -> Optional[CallSession]:
         with self._lock:
@@ -161,6 +177,26 @@ class CallManager:
             return False
         session.request_hangup()
         return True
+
+    def get_call_by_tracking_id(self, tracking_id: str) -> Optional[CallSession]:
+        """tracking_id is caller-supplied (dynamic_variables) and is what
+        ElevenLabs already has on hand mid-call, unlike our internal
+        call_id. Not guaranteed unique across the process lifetime (e.g. a
+        retried batch could reuse one) -- prefer the most recently created
+        matching session, since that's the one still plausibly in-flight."""
+        with self._lock:
+            candidates = [s for s in self._sessions.values() if s.tracking_id == tracking_id]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda s: s.created_at)
+
+    def transfer_by_tracking_id(self, tracking_id: str) -> Optional[dict]:
+        """Blocks until the transfer resolves or times out -- call off the
+        event loop (see main.py's use of run_in_threadpool)."""
+        session = self.get_call_by_tracking_id(tracking_id)
+        if session is None:
+            return None
+        return session.request_transfer()
 
     # ------------------------------------------------------------------
     def health(self) -> dict:
@@ -265,5 +301,6 @@ class CallManager:
                 "abandoning wait (process exit will reclaim remaining threads)"
             )
 
+        self._analysis_fetcher.shutdown()
         self._webhook_sender.shutdown()
         logger.info("call manager shut down")

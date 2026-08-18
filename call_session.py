@@ -39,6 +39,7 @@ from typing import Optional
 from elevenlabs.client import ElevenLabs
 from elevenlabs.conversational_ai.conversation import ClientTools, Conversation, ConversationInitiationData
 
+import db
 import sip_protocol as sip
 from audio_bridge import RtpAudioInterface
 from config import Settings
@@ -80,6 +81,9 @@ class CallSession:
         self._extension_pool = extension_pool
         self.logger = get_call_logger(self.call_id)
         self.conversation_id = None
+        # Filled in after the call by AnalysisFetcher (evaluation criteria +
+        # data collection results). None until ElevenLabs finishes analysing.
+        self.analysis: Optional[dict] = None
         self.transferred_to: Optional[str] = None
         self._transfer_requests: "queue.Queue[_TransferRequest]" = queue.Queue()
 
@@ -109,12 +113,40 @@ class CallSession:
         self._stream: Optional[sip.SipStream] = None
         self._rtp_interface: Optional[RtpAudioInterface] = None
         self._conversation: Optional[Conversation] = None
+        self._last_reject_code: Optional[int] = None
+
+    def _db_call(self, func, *args, **kwargs) -> None:
+        """Best-effort write to BatchCallDetails -- never let a DB hiccup
+        affect the SIP call flow."""
+        if not self.tracking_id:
+            return
+        try:
+            func(self.tracking_id, *args, **kwargs)
+        except Exception:
+            self.logger.exception(f"failed to record call status in BatchCallDetails ({func.__name__})")
 
     # ------------------------------------------------------------------
     # Public control surface (called by CallManager / API layer)
     # ------------------------------------------------------------------
     def request_hangup(self) -> None:
         self._hangup_requested.set()
+
+    def request_transfer(self) -> dict:
+        """HTTP-triggered counterpart to the "transfer_call" ElevenLabs
+        client tool (see _handle_transfer_tool_call) -- lets a server-side
+        webhook tool (ElevenLabs calling POST /calls/{call_id}/transfer on
+        this service) drive the same SIP REFER flow instead of an
+        SDK-registered client tool. Blocks the calling thread until the
+        transfer resolves or times out, so callers (main.py) must run this
+        off the event loop."""
+        return self._handle_transfer_tool_call({})
+
+    def set_analysis(self, analysis: dict) -> None:
+        """Called from an analysis-fetch thread once ElevenLabs' post-call
+        record is available; guarded like every other cross-thread write to
+        session state (F-24)."""
+        with self._status_lock:
+            self.analysis = analysis
 
     def _set_status(self, status: CallStatus, error: Optional[str] = None) -> None:
         with self._status_lock:
@@ -145,13 +177,22 @@ class CallSession:
                 "answered": self.answered,
                 "talk_seconds": talk_seconds,
                 "transferred_to": self.transferred_to,
+                "analysis": self.analysis,
             }
 
-    def to_webhook_payload(self) -> dict:
+    def to_webhook_payload(self, event: str = "call_status") -> dict:
         """Terminal-state notification payload sent to the configured webhook.
 
         Reuses the same fields as to_dict()/CallDetail -- no new state is
         introduced, this is just a different shape for external consumers.
+
+        Sent twice per call when post-call analysis is enabled:
+          - event="call_status"   immediately at terminal status, analysis=null
+          - event="call_analysis" seconds later, once ElevenLabs has produced
+                                  the evaluation/data-collection results
+        Everything except `event` and `analysis` is identical between the
+        two, so a consumer that only cares about completion can keep
+        processing the first one exactly as before and ignore the second.
         """
         with self._status_lock:
             started_at = self.dialed_at if self.dialed_at is not None else self.created_at
@@ -159,6 +200,7 @@ class CallSession:
             if self.ended_at is not None and started_at is not None:
                 duration_seconds = round(self.ended_at - started_at, 3)
             return {
+                "event": event,
                 "call_id": self.call_id,
                 "conversation_id": self.conversation_id,
                 "status": self.status.value,
@@ -166,6 +208,7 @@ class CallSession:
                 "ended_at": self.ended_at,
                 "duration_seconds": duration_seconds,
                 "reason": self.exit_reason or self.error or self.status.value,
+                "analysis": self.analysis,
                 "metadata": {
                     "phone_number": self.phone_number,
                     "tracking_id": self.tracking_id,
@@ -221,6 +264,29 @@ class CallSession:
         with self._status_lock:  # F-24: write under the same lock to_dict() reads under
             self.exit_reason = exit_reason
             self.ended_at = time.time()
+        self._record_call_ended(exit_reason)
+
+    def _record_call_ended(self, exit_reason: str) -> None:
+        """BatchCallDetails.EndedAt is set for every terminal reason. Status
+        is only overwritten for the two cases the PBX call-status scheme
+        distinguishes as terminal outcomes in their own right --
+        Cancelled (486/503, or a local hangup before the callee answered)
+        and Timeout (we sent CANCEL after max_ring_seconds with no answer).
+        Every other terminal reason (BYE either side, transfer, max
+        duration, RTP inactivity, or a failure outside the 4-status scheme)
+        just stamps EndedAt and leaves Status as whatever mark_ringing/
+        mark_answered already set."""
+        reject_status = db.sip_response_to_status(self._last_reject_code) if self._last_reject_code else None
+        if exit_reason == "ring_timeout":
+            self._db_call(db.mark_ended, status=db.STATUS_TIMEOUT)
+        elif exit_reason == "local_hangup" and not self.answered:
+            self._db_call(db.mark_ended, status=db.STATUS_CANCELLED)
+        elif reject_status is not None:
+            self._db_call(db.mark_ended, status=reject_status)
+        elif exit_reason in (
+            "remote_bye", "agent_ended", "local_hangup", "max_duration", "rtp_timeout", "transferred",
+        ):
+            self._db_call(db.mark_ended)
 
     # ------------------------------------------------------------------
     # SIP handshake + bridge (equivalent to the reference script's main())
@@ -311,6 +377,7 @@ class CallSession:
                 ).encode()
             )
             self._set_status(CallStatus.RINGING)
+            self._db_call(db.mark_ringing)
             self.logger.info(f"sent authenticated INVITE (attempt {auth_attempts}), waiting for target to answer")
 
             outcome, remote_tag, answer_sdp = self._wait_for_answer(invite_branch, cseq)
@@ -349,6 +416,7 @@ class CallSession:
         # actually reachable the same way, which breaks the RTP path.
         media_ip = cfg.pbx_ip
         self.answered = True
+        self._db_call(db.mark_answered)
 
         ack_branch = sip.new_branch()  # F-14: ACK to a 2xx is its own transaction
         self._sock.sendall(
@@ -373,6 +441,7 @@ class CallSession:
         deadline = time.monotonic() + cfg.max_ring_seconds
         remote_tag = ""
         self._last_reject_reason = "rejected"
+        self._last_reject_code = None
         self._last_challenge_frame = None
 
         while not self._hangup_requested.is_set():
@@ -419,14 +488,17 @@ class CallSession:
 
             if 300 <= code < 400:
                 self._last_reject_reason = "redirect_unsupported"
+                self._last_reject_code = code
                 return "rejected", "", ""
 
             if code in (486, 603, 600, 604):
                 self._last_reject_reason = f"rejected_{code}"
+                self._last_reject_code = code
                 return "rejected", "", ""
 
-            # Any other 4xx/5xx/6xx
+            # Any other 4xx/5xx/6xx (e.g. 503)
             self._last_reject_reason = f"failed_{code}_{reason_phrase}".strip()
+            self._last_reject_code = code
             return "rejected", "", ""
 
         return "cancelled", "", ""
@@ -675,6 +747,10 @@ class CallSession:
             frame_bytes=cfg.frame_bytes,
             log_dir=cfg.log_dir,
             on_turn_latency=_on_turn_latency,
+            antialias=cfg.audio_antialias,
+            antialias_cutoff_hz=cfg.audio_antialias_cutoff_hz,
+            antiimage=cfg.audio_antiimage,
+            antiimage_cutoff_hz=cfg.audio_antiimage_cutoff_hz,
             logger=self.logger,
         )
 

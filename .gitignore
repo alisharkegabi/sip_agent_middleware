@@ -1,6 +1,19 @@
 .env
 venv/
 sqlservertest.py
-__pycache__/
-*.md
 logs/
+__pycache__/
+local/
+
+# Claude working files -- session prompts, analyses, handoff notes.
+# Both spellings on purpose: the folder on disk is Claude_files/, and the
+# lowercase pattern only matches it on case-insensitive filesystems
+# (Windows). Spelled out so a Linux/WSL/CI checkout ignores it too.
+claude_files/
+Claude_files/
+claude.md
+CLAUDE.md
+.claude/
+*.md
+LATENCY_RESTART.md
+LATENCY_HANDOFF.md
