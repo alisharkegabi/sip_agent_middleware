@@ -27,13 +27,68 @@ so it has to stay cheap.
 
 - `normalize_arabic(text)` — strips tashkeel/harakat, tatweel, normalises
   alef/hamza forms (`أ إ آ ٱ` → `ا`), `ى` → `ي`, `ة` → `ه`, `ؤ` → `و`,
-  `ئ` → `ي`, converts Arabic-Indic digits to ASCII, strips ASCII and Arabic
-  punctuation, collapses whitespace, casefolds.
+  `ئ` → `ي`, converts Arabic-Indic digits to ASCII, replaces punctuation
+  with a space, collapses whitespace, casefolds. Punctuation becomes a
+  space rather than being deleted: deleting merged the words either side of
+  an unspaced mark, so `المكالمة،دلوقتي` became one token and a plainly
+  spoken phrase stopped matching.
 - `matches_transfer_phrase(text, phrases)` — normalises `text` and every
-  entry in `phrases`, returns `True` if any normalised phrase is a
-  substring of the normalised text. A blank phrase never matches (guards
-  against `TRANSFER_TRIGGER_EXTRA_PHRASES=""` splitting into `[""]`, which
-  would otherwise transfer on the agent's first word).
+  entry in `phrases`, returns `True` if any normalised phrase occurs as a
+  substring of the normalised text **and that occurrence is not negated**.
+  A blank phrase never matches (guards against
+  `TRANSFER_TRIGGER_EXTRA_PHRASES=""` splitting into `[""]`, which would
+  otherwise transfer on the agent's first word).
+
+#### Deciding whether the agent is ASSERTING the phrase
+
+Firing the trigger transfers a live customer and ends the AI leg, so an
+utterance that merely *contains* the trigger sentence is not enough — the
+agent has to be asserting it. Four things defeat a plain substring test, and
+all four were observed as real counter-examples:
+
+| Rule | Utterance | Behaviour |
+|---|---|---|
+| **Negation** | `مش هيتم تحويل المكالمة دلوقتي` | suppressed |
+| **Clause scope** | `مش مشكلة، هيتم تحويل المكالمة دلوقتي` | **fires** — the `مش` negates `مشكلة` in its own clause |
+| **Absorption** | `مش بس هيتم تحويل المكالمة دلوقتي` ("not only") | **fires** — the negator lands on `بس` |
+| **Absorption** | `مفيش مشكلة هيتم تحويل المكالمة دلوقتي` | **fires** — even with the comma dropped by STT |
+| **Complement** | `مش المفروض إنه هيتم تحويل المكالمة دلوقتي` | suppressed — `إنه` links the negated predicate to the phrase |
+| **Never** | `عمرها ما هيتم تحويل المكالمة دلوقتي` | suppressed |
+| **Interrogative** | `هيتم تحويل المكالمة دلوقتي ولا لأ؟` | suppressed — asking, not telling |
+
+Mechanically: negators are `مش`, `لن`, `ليس`, `لست`, `مافيش`, `مفيش` (with or
+without an attached `و`/`ف`). A negator counts when it sits within two words
+of the phrase in the same clause and is not absorbed by `بس`/`مشكلة`/`مانع`,
+**or** at any distance in the same clause when a complementizer (`إن`, `إنه`,
+…) links it to the phrase. Bare `ما` is deliberately not a negator — far too
+common as a relative pronoun — and is recognised only in the fixed `عمر… ما`
+pair. A clause ending in `؟`, or carrying a `ولا لأ` tag, is a question.
+
+Two guards matter as much as the rules themselves, and both are tested:
+`مش عارف أساعدك أكتر من كده هيتم تحويل المكالمة دلوقتي` must fire (a distant
+negator with no complementizer link), and `هيتم تحويل المكالمة دلوقتي. تمام؟`
+must fire (the question is a separate clause).
+
+> **This is still a heuristic over free LLM prose, and it still has a
+> ceiling.** Every rule above exists because a counter-example was found;
+> the next counter-example is a matter of time, not of cleverness. Note that
+> the "not only"/"no problem" cases need a lookbehind *narrower* than two
+> words while the complementizer case needs a *wider* one — distance alone
+> can never settle it, which is why the rules are structural rather than
+> just a bigger window.
+>
+> **The robust fix is agent-side**: have the agent emit a marker it would
+> never produce conversationally — a rare sentinel token in the response, or
+> the `transfer_call` client tool — and match on that instead of inferring
+> intent from prose. That is an ElevenLabs dashboard change, not a code
+> change, and it retires this whole section.
+
+> **Do not rewrite `_TASHKEEL_RE` as literal Arabic.** It is written as
+> escaped codepoints because as literals the class renders right-to-left:
+> retyping it silently reordered U+065F and U+0670 into a range that
+> swallowed U+0660–U+0669, the Arabic-Indic digits, which then vanished
+> before `_ARABIC_INDIC_DIGITS` could convert them. The existing
+> `test_digits_normalised` caught it.
 
 ### `static_audio.py` (new file)
 Loads the "all lines busy" WAV into RTP-ready mu-law frames.
@@ -107,11 +162,27 @@ See `CALL_STATUS_TRACKING.md` for the full status scheme and the exact
   enqueues a `_TransferRequest(extension=None, ...)`; the bridge loop is the
   only place that calls `ExtensionPool.acquire()`. This means "all lines
   busy" behaves identically no matter what triggered the transfer.
-- **`_wait_for_playout(quiet_seconds, timeout)`** — blocks the SIP thread
-  (not the RTP send/recv threads, which keep running) until the RTP play
-  queue has been empty for `quiet_seconds` with no new TTS chunk arriving.
-  Used before acquiring an extension, so the trigger sentence itself
-  finishes reaching the caller before anything else happens.
+- **`_wait_for_playout(quiet_seconds, timeout, wait_for_start)`** — blocks
+  the SIP thread (not the RTP send/recv threads, which keep running) until
+  the RTP play queue has been empty for `quiet_seconds` with no new TTS
+  chunk arriving. Used before acquiring an extension, so the trigger
+  sentence itself finishes reaching the caller before anything else
+  happens.
+
+  > **`wait_for_start` is not optional on the transfer path.**
+  > `on_agent_response` fires on the LLM's *text*, which arrives before any
+  > audio for that sentence reaches `output()`. At that instant the
+  > previous turn has long since drained, so `playout_pending() == 0` and
+  > `last_output_monotonic` is seconds old — both drain conditions are
+  > already satisfied and the wait returned in one poll interval,
+  > transferring the caller before they had heard a word of the
+  > announcement. With `TRANSFER_PLAYOUT_START_TIMEOUT_SECONDS` set, the
+  > method first waits up to that long for the sentence's audio to *start*
+  > (queue becomes non-empty, or a new chunk arrives) and only then begins
+  > measuring drain/quiet. If audio never starts it gives up after that
+  > window rather than burning the whole `timeout` — the SIP thread holds
+  > the only reader of the SIP socket. Pinned by
+  > `tests/test_transfer_playout_wait.py`.
 - **`_close_el_session()`** — closes the ElevenLabs websocket. Idempotent
   and bounded by `EL_END_SESSION_TIMEOUT_SECONDS` (a daemon thread + timed
   join) so a slow `end_session()` can never stall the SIP thread. Called on
@@ -171,6 +242,41 @@ tool/HTTP paths) block on an `Event`; the actual extension acquisition, REFER
 send, and response handling happen back on the SIP thread, which is the only
 thread already looping on `self._stream.read_message()`.
 
+## REFER outcome handling (`_perform_transfer`)
+
+`_perform_transfer` returns `(next_cseq, outcome)` where outcome is one of
+`"transferred"`, `"remote_bye"`, or `"failed"`. The rules below all exist
+because an earlier version treated a perfectly normal SIP message as a fatal
+error; all three are pinned by `tests/test_transfer_refer_flow.py`, which
+drives a real TCP peer on loopback.
+
+- **Provisional responses to the REFER (`< 200`) are not outcomes.** A PBX
+  may send `100 Trying` for an in-dialog REFER before `202 Accepted`. That
+  means the transaction is alive, not that it resolved. Treating any non-2xx
+  as a rejection aborted the transfer on the first message such a PBX sent.
+- **Provisional NOTIFY sipfrags (`< 200`) are not outcomes either.** RFC 3515
+  has the notifier relay the referred-to leg's provisional responses:
+  `100 Trying`, then `180 Ringing` / `183 Session Progress` for as long as
+  the extension is alerting. Only a final (`>= 200`) fragment resolves the
+  transfer. Accepting *only* `100` as provisional meant every transfer to an
+  extension that rings before a human picks up — the normal case — was
+  recorded as a failure.
+- **An in-dialog BYE is only a completed transfer if the referred-to leg
+  progressed.** `refer_progressed` is set once a NOTIFY reports `>= 180`.
+  Some PBXes do complete a blind transfer by BYEing our leg instead of
+  sending a final NOTIFY, so that reading has to keep working — but applying
+  it unconditionally meant a **caller hanging up while on hold** was recorded
+  as a successful transfer: `Status = Transfer` for a call no human ever
+  took, plus the extension quarantined for `TRANSFER_EXTENSION_BUSY_SECONDS`.
+  With no progress signal, a BYE is now read as the hangup it almost
+  certainly is: outcome `"remote_bye"`, `_mark_transfer_failed()`, and the
+  extension released without a busy hold.
+
+`"remote_bye"` exists as a distinct outcome because the bridge loop must
+break **without** sending a BYE of its own (`_perform_transfer` already
+answered the caller's BYE with 200 OK) — and must break rather than
+`continue`, or the loop would spin on a dead dialog until `MAX_CALL_SECONDS`.
+
 ## "All lines busy" prompt
 
 Text (Arabic, verbatim — do not reword):
@@ -202,6 +308,10 @@ TRANSFER_TRIGGER_PHRASE=هيتم تحويل المكالمة دلوقتي
 TRANSFER_TRIGGER_EXTRA_PHRASES=
 TRANSFER_PLAYOUT_TIMEOUT_SECONDS=10
 TRANSFER_PLAYOUT_QUIET_SECONDS=0.6
+# How long to wait for the trigger sentence's audio to START before
+# transferring anyway. Without this the playout wait returns instantly --
+# see _wait_for_playout above.
+TRANSFER_PLAYOUT_START_TIMEOUT_SECONDS=2
 EL_END_SESSION_TIMEOUT_SECONDS=3
 # "All lines busy" static prompt, played when the trigger fires but no
 # internal extension is free.

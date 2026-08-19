@@ -100,6 +100,15 @@ class Settings:
     transfer_playout_quiet_seconds: float = field(
         default_factory=lambda: _env_float("TRANSFER_PLAYOUT_QUIET_SECONDS", 0.6)
     )
+    # How long to wait for the trigger sentence's TTS audio to START
+    # arriving before giving up and transferring anyway. Needed because
+    # callback_agent_response fires on the LLM's text, ahead of any audio --
+    # without this the drain check below sees an empty queue and a stale
+    # last-output timestamp and returns instantly. See
+    # CallSession._wait_for_playout.
+    transfer_playout_start_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("TRANSFER_PLAYOUT_START_TIMEOUT_SECONDS", 2.0)
+    )
     # Bounded wait when closing the ElevenLabs websocket on the transfer
     # path -- end_session() must never be allowed to stall the SIP thread.
     el_end_session_timeout_seconds: float = field(
