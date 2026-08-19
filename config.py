@@ -12,6 +12,8 @@ import os
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
+from transfer_trigger import normalize_arabic
+
 load_dotenv(override=True)
 
 
@@ -63,6 +65,13 @@ class Settings:
     el_start_timeout_seconds: float = field(default_factory=lambda: _env_float("EL_START_TIMEOUT_SECONDS", 10.0))
     max_auth_attempts: int = field(default_factory=lambda: _env_int("MAX_AUTH_ATTEMPTS", 2))
     cancel_wait_seconds: float = field(default_factory=lambda: _env_float("CANCEL_WAIT_SECONDS", 5.0))
+    # How long to wait for the final response to a BYE before giving up and
+    # closing the socket. The BYE used to be fire-and-forget, so a rejected
+    # one was invisible and could leave our leg up on the PBX -- see
+    # CallSession._await_bye_response.
+    bye_response_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("BYE_RESPONSE_TIMEOUT_SECONDS", 2.0)
+    )
 
     # --- Call transfer (SIP REFER to an internal extension) ---
     # CSV of extensions the agent may blind-transfer a call to, e.g. "201,202,203".
@@ -77,6 +86,60 @@ class Settings:
     transfer_extension_busy_seconds: float = field(
         default_factory=lambda: _env_float("TRANSFER_EXTENSION_BUSY_SECONDS", 300.0)
     )
+
+    # Phrase the agent speaks to trigger an internal transfer. Detection is
+    # on the agent's own transcript (CallSession._maybe_trigger_transfer,
+    # fed by callback_agent_response) -- ElevenLabs no longer POSTs to this
+    # service, and no client tool call is required, to start a transfer.
+    transfer_trigger_phrase: str = field(
+        default_factory=lambda: _env_str("TRANSFER_TRIGGER_PHRASE", "هيتم تحويل المكالمة دلوقتي")
+    )
+    # CSV of additional phrases that also trigger a transfer if spoken.
+    transfer_trigger_extra_phrases: str = field(
+        default_factory=lambda: _env_str("TRANSFER_TRIGGER_EXTRA_PHRASES", "")
+    )
+    # How long to let the trigger sentence finish playing out to the caller
+    # before sending the REFER -- callback_agent_response fires when the
+    # LLM's text arrives, seconds before the caller actually hears it.
+    transfer_playout_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("TRANSFER_PLAYOUT_TIMEOUT_SECONDS", 10.0)
+    )
+    transfer_playout_quiet_seconds: float = field(
+        default_factory=lambda: _env_float("TRANSFER_PLAYOUT_QUIET_SECONDS", 0.6)
+    )
+    # How long to wait for the trigger sentence's TTS audio to START
+    # arriving before giving up and transferring anyway. Needed because
+    # callback_agent_response fires on the LLM's text, ahead of any audio --
+    # without this the drain check below sees an empty queue and a stale
+    # last-output timestamp and returns instantly. See
+    # CallSession._wait_for_playout.
+    transfer_playout_start_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("TRANSFER_PLAYOUT_START_TIMEOUT_SECONDS", 2.0)
+    )
+    # Bounded wait when closing the ElevenLabs websocket on the transfer
+    # path -- end_session() must never be allowed to stall the SIP thread.
+    el_end_session_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("EL_END_SESSION_TIMEOUT_SECONDS", 3.0)
+    )
+
+    # --- "All lines busy" static prompt (played when the transfer trigger
+    # fires but no extension is free) ---
+    busy_prompt_enabled: bool = field(default_factory=lambda: _env_bool("BUSY_PROMPT_ENABLED", True))
+    busy_prompt_audio_path: str = field(
+        default_factory=lambda: _env_str("BUSY_PROMPT_AUDIO_PATH", "./assets/audio/all_lines_busy.wav")
+    )
+    busy_prompt_tail_seconds: float = field(
+        default_factory=lambda: _env_float("BUSY_PROMPT_TAIL_SECONDS", 0.8)
+    )
+
+    # Normalised, blank-filtered phrase tuple, computed once at Settings
+    # construction (see __post_init__) rather than per transcript line --
+    # on_agent_response runs on the ElevenLabs SDK's websocket receive
+    # thread for every live call and must stay cheap. An empty entry here
+    # (e.g. a trailing comma in TRANSFER_TRIGGER_EXTRA_PHRASES) is filtered
+    # out deliberately: an empty phrase is a substring of everything, which
+    # would transfer on the agent's first word.
+    transfer_trigger_phrases_normalized: tuple[str, ...] = field(default_factory=tuple, init=False)
 
     # --- RTP ---
     rtp_port_min: int = field(default_factory=lambda: _env_int("RTP_PORT_MIN", 10000))
@@ -203,6 +266,16 @@ class Settings:
             "guarantor_name:gr_gender,guarantor_name_full:gr_gender",
         )
     )
+
+    def __post_init__(self) -> None:
+        # Settings is frozen (immutable after construction, like every other
+        # field here) -- object.__setattr__ is the documented escape hatch
+        # dataclasses itself uses internally for exactly this case.
+        raw_phrases = [self.transfer_trigger_phrase] + self.transfer_trigger_extra_phrases.split(",")
+        normalized = tuple(
+            normalize_arabic(p) for p in raw_phrases if normalize_arabic(p)
+        )
+        object.__setattr__(self, "transfer_trigger_phrases_normalized", normalized)
 
 
 settings = Settings()

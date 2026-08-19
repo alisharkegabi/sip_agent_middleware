@@ -255,6 +255,17 @@ class RtpAudioInterface(AudioInterface):
         self._on_turn_latency = on_turn_latency
         self._logger = logger
         self.last_rx_monotonic: Optional[float] = None  # F-02 watchdog hook
+        # Set at the top of every output() call -- lets the transfer path
+        # (CallSession._wait_for_playout) distinguish "the play queue is
+        # empty because the sentence finished" from "it's empty because the
+        # next TTS chunk just hasn't arrived yet".
+        self.last_output_monotonic: Optional[float] = None
+        # Latched by play_static_frames(): once a terminal static prompt
+        # owns the line, agent TTS arriving on the still-open ElevenLabs
+        # websocket is dropped rather than queued behind (or interleaved
+        # with) the prompt. Deliberately never cleared -- the only caller
+        # is the "all lines busy" path, which hangs up immediately after.
+        self._static_playback = False
 
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         if os.name == "nt":
@@ -390,6 +401,13 @@ class RtpAudioInterface(AudioInterface):
 
     def output(self, audio: bytes):
         """Receives TTS audio chunks from ElevenLabs."""
+        if self._static_playback:
+            # A terminal static prompt owns the line -- drop agent audio so
+            # it can't play over or after it. The websocket is still open
+            # at this point (it's closed only once the prompt has finished
+            # playing, because closing it stops this audio interface).
+            return
+        self.last_output_monotonic = time.monotonic()
 
         # --- Latency Instrumentation (compute under lock, write off lock) ---
         log_entry = None
@@ -467,12 +485,65 @@ class RtpAudioInterface(AudioInterface):
         payload = self._pcm16k_to_ulaw8k(audio)
         frames = [payload[i:i + self._frame_bytes] for i in range(0, len(payload), self._frame_bytes)]
         with self._play_cv:
+            if self._static_playback:
+                # Re-checked INSIDE the lock, not just at the top of this
+                # method. Everything between the two checks -- the latency
+                # bookkeeping, the log write+flush, the resample above --
+                # runs off-lock and takes real time, and this method runs on
+                # the ElevenLabs websocket thread while play_static_frames()
+                # runs on the SIP thread. A chunk that passed the top check
+                # just before the prompt latched would otherwise land its
+                # frames on the queue AFTER the prompt's, and the caller
+                # would hear a fragment of the agent following "all lines
+                # are busy".
+                return
             self._play_queue.extend(frames)
             self._play_cv.notify()
 
     def interrupt(self):
         with self._play_cv:
             self._play_queue.clear()
+
+    def playout_pending(self) -> int:
+        """Number of mu-law frames still queued for transmission. Polled by
+        CallSession._wait_for_playout on the SIP thread -- not the audio
+        threads -- to know when a sentence has actually finished reaching
+        the caller."""
+        with self._play_cv:
+            return len(self._play_queue)
+
+    def play_static_frames(self, frames: list[bytes]) -> bool:
+        """Queue pre-built mu-law frames (e.g. the "all lines busy" prompt)
+        directly for transmission, bypassing the PCM16k->mu-law resampling
+        path entirely -- the frames are already mu-law. Clears whatever is
+        currently queued first, same as interrupt(), so the static prompt is
+        never mixed with tail-end agent audio, and latches _static_playback
+        so no further agent TTS is queued behind it.
+
+        Returns True if the frames were queued. Returns False (having
+        logged why) if this interface is no longer able to transmit --
+        which is what happens if the ElevenLabs session was ended first,
+        since Conversation.end_session() calls stop() on this object."""
+        if not self.is_running:
+            if self._logger:
+                self._logger.warning(
+                    "play_static_frames called but the RTP interface is stopped "
+                    "(is_running=False) -- nothing will be transmitted"
+                )
+            return False
+        if not self.remote_port:
+            if self._logger:
+                self._logger.warning(
+                    "play_static_frames called but no remote RTP port is known -- "
+                    "nothing will be transmitted"
+                )
+            return False
+        with self._play_cv:
+            self._static_playback = True
+            self._play_queue.clear()
+            self._play_queue.extend(frames)
+            self._play_cv.notify()
+        return True
 
     def _rtp_send_loop(self):
         next_send = time.monotonic()

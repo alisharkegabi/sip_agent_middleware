@@ -34,11 +34,14 @@ class DbSettings:
 
 db_settings = DbSettings()
 
-# Statuses as logged in dbo.BatchCallDetails.Status.
+# Statuses as logged in dbo.BatchCallDetails.Status (nvarchar(20) -- both
+# new values below are short by design, but there's ample room either way).
 STATUS_RINGING = "Ringing"
 STATUS_ANSWERED = "Answered"
 STATUS_CANCELLED = "Cancelled"
 STATUS_TIMEOUT = "Timeout"
+STATUS_TRANSFERRED = "Transfer"      # REFER confirmed, caller landed on the extension
+STATUS_TRANSFER_FAILED = "TranFail"  # transfer was announced but never completed
 
 # SIP final responses that mean the callee/PBX rejected or cancelled the dialog.
 _CANCELLED_SIP_CODES = {486, 503}
@@ -103,11 +106,14 @@ def mark_ended(
     """
     Record that the call ended -- a BYE was sent/received, the dialog was
     cancelled (486/503, or CANCEL sent for an unconfirmed dialog on ring
-    timeout), or otherwise terminated.
+    timeout), the call was transferred (or an announced transfer failed to
+    complete), or otherwise terminated.
 
-    Pass `status=STATUS_CANCELLED` or `status=STATUS_TIMEOUT` for those
-    terminal cases. Leave `status` unset for a normal BYE after the call was
-    already marked Answered -- Status stays as-is and only EndedAt is set.
+    Pass `status=STATUS_CANCELLED`, `status=STATUS_TIMEOUT`,
+    `status=STATUS_TRANSFERRED`, or `status=STATUS_TRANSFER_FAILED` for
+    those terminal cases. Leave `status` unset for a normal BYE after the
+    call was already marked Answered -- Status stays as-is and only EndedAt
+    is set.
     """
     ended_at = ended_at or datetime.now(timezone.utc)
     conn = get_connection()
