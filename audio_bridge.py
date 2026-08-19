@@ -485,6 +485,18 @@ class RtpAudioInterface(AudioInterface):
         payload = self._pcm16k_to_ulaw8k(audio)
         frames = [payload[i:i + self._frame_bytes] for i in range(0, len(payload), self._frame_bytes)]
         with self._play_cv:
+            if self._static_playback:
+                # Re-checked INSIDE the lock, not just at the top of this
+                # method. Everything between the two checks -- the latency
+                # bookkeeping, the log write+flush, the resample above --
+                # runs off-lock and takes real time, and this method runs on
+                # the ElevenLabs websocket thread while play_static_frames()
+                # runs on the SIP thread. A chunk that passed the top check
+                # just before the prompt latched would otherwise land its
+                # frames on the queue AFTER the prompt's, and the caller
+                # would hear a fragment of the agent following "all lines
+                # are busy".
+                return
             self._play_queue.extend(frames)
             self._play_cv.notify()
 

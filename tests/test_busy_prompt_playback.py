@@ -107,3 +107,34 @@ class TestAgentAudioIsDroppedDuringPlayback:
         rtp.play_static_frames(FRAMES)
         # Tail-end agent audio is cleared, not played ahead of the prompt.
         assert rtp.playout_pending() == len(FRAMES)
+
+
+class TestStaticPlaybackRaceWithInFlightTts:
+    def test_chunk_that_lost_the_race_mid_resample_is_dropped(self, rtp):
+        """THE RACE: output() checked _static_playback only at the TOP of
+        the method, then ran the latency bookkeeping, a log write+flush and
+        the whole resample OFF-LOCK before queueing anything.
+        play_static_frames() runs on the SIP thread and can latch anywhere
+        in that window -- after which output() appended its frames BEHIND
+        the prompt's, and the caller heard a fragment of the agent following
+        "all lines are busy".
+
+        The window is reproduced deterministically by latching from inside
+        the resample, which is precisely where the real thread switch lands.
+        A sleep-based version of this test would be flaky and would not pin
+        anything."""
+        rtp.is_running = True
+        original_resample = rtp._pcm16k_to_ulaw8k
+
+        def _resample_then_lose_the_race(pcm):
+            out = original_resample(pcm)
+            rtp.play_static_frames(FRAMES)  # the SIP thread gets in here
+            return out
+
+        rtp._pcm16k_to_ulaw8k = _resample_then_lose_the_race
+        rtp.output(b"\x00\x01" * 1600)
+
+        assert rtp.playout_pending() == len(FRAMES), (
+            "agent audio was queued behind the terminal prompt"
+        )
+        assert list(rtp._play_queue) == FRAMES, "the queue must hold the prompt and nothing else"
