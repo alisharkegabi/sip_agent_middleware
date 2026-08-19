@@ -695,7 +695,9 @@ class CallSession:
         if not done.wait(timeout=self.settings.el_end_session_timeout_seconds):
             self.logger.warning("ElevenLabs end_session did not return within timeout, abandoning wait")
 
-    def _wait_for_playout(self, *, quiet_seconds: float, timeout: float) -> None:
+    def _wait_for_playout(
+        self, *, quiet_seconds: float, timeout: float, wait_for_start: float = 0.0
+    ) -> None:
         """Block until the RTP play queue has been empty, with no new TTS
         chunk having arrived, for `quiet_seconds`, or until `timeout`
         elapses. Runs on the SIP thread; the RTP send/recv loops are
@@ -703,11 +705,46 @@ class CallSession:
         does not pace anything itself. Used so a just-announced sentence
         (the transfer trigger phrase, or the busy prompt itself) actually
         finishes reaching the caller before the next thing happens. Bounded
-        by `timeout` so a stuck TTS stream can never wedge the SIP thread."""
+        by `timeout` so a stuck TTS stream can never wedge the SIP thread.
+
+        `wait_for_start` exists because of the ordering that motivates this
+        whole method: on_agent_response fires when the LLM's TEXT arrives,
+        which is BEFORE any audio for that sentence reaches output(). At
+        that instant the previous turn's audio has long since drained, so
+        `pending == 0` and `last_output_monotonic` is already seconds old --
+        both exit conditions are satisfied and the wait returned
+        immediately, which defeated its entire purpose and let the REFER go
+        out before the caller heard a word of the announcement. When
+        `wait_for_start` > 0 we first spend up to that long waiting for the
+        sentence's audio to actually START (queue becomes non-empty, or a
+        new chunk arrives), and only then begin measuring drain/quiet. If
+        the audio never starts -- the agent produced text but no speech, or
+        the session died -- we give up after `wait_for_start` and carry on
+        rather than burning the whole `timeout`."""
         if self._rtp_interface is None:
             return
-        deadline = time.monotonic() + timeout
         poll_interval = 0.05
+        deadline = time.monotonic() + timeout
+
+        if wait_for_start > 0:
+            baseline = self._rtp_interface.last_output_monotonic
+            start_deadline = min(time.monotonic() + wait_for_start, deadline)
+            started = False
+            while time.monotonic() < start_deadline:
+                if (
+                    self._rtp_interface.playout_pending() > 0
+                    or self._rtp_interface.last_output_monotonic != baseline
+                ):
+                    started = True
+                    break
+                time.sleep(poll_interval)
+            if not started:
+                self.logger.warning(
+                    f"no TTS audio started within {wait_for_start:.2f}s of the agent's text; "
+                    "not waiting for playout"
+                )
+                return
+
         while time.monotonic() < deadline:
             pending = self._rtp_interface.playout_pending()
             last_output = self._rtp_interface.last_output_monotonic
@@ -763,14 +800,50 @@ class CallSession:
 
         self._close_el_session()
 
+    def _send_bye(self, *, dialog_kwargs: dict, remote_tag: str, cseq: int) -> int:
+        """Send an in-dialog BYE as its own transaction; return the CSeq it
+        used so the caller can keep counting from there.
+
+        The increment is the whole point of this helper existing. RFC 3261
+        §12.2.1.1: each new request within a dialog MUST carry a CSeq
+        strictly greater than the previous one. The bridge loop's hangup
+        path used to build its BYE with whatever `cseq` it happened to be
+        holding -- the INVITE's on the normal path, and after a failed
+        REFER, the REFER's own. Same number, different method: a strict peer
+        answers 500 and the PBX-side dialog outlives our cleanup. Rare
+        before, because a failed transfer was rare; this branch made an
+        announced-but-failed transfer an ordinary occurrence, so it stopped
+        being theoretical. Both BYE sites now go through here."""
+        cseq += 1
+        try:
+            self._sock.sendall(
+                sip.build_bye(
+                    **dialog_kwargs,
+                    branch=sip.new_branch(),  # F-14: BYE is its own transaction
+                    cseq=cseq,
+                    remote_tag=remote_tag,
+                ).encode()
+            )
+        except Exception:
+            pass
+        return cseq
+
     def _perform_transfer(
         self, request: "_TransferRequest", *, dialog_kwargs: dict, remote_tag: str, cseq: int
-    ) -> tuple[int, bool]:
+    ) -> tuple[int, str]:
         """Runs on the SIP thread, inside _bridge()'s loop. Sends the
         in-dialog REFER, then handles subsequent SIP traffic itself
         (matching the REFER's own CSeq, answering the transfer-progress
         NOTIFY(s)) until a final outcome or timeout, and reports it back to
-        the waiting ClientTools thread. Returns (next_cseq, transferred)."""
+        the waiting requester thread.
+
+        Returns (next_cseq, outcome) where outcome is one of:
+          "transferred" -- the caller is on the extension; our leg is done.
+          "remote_bye"  -- the caller hung up mid-transfer. The dialog is
+                           already torn down and 200 OK'd, so the bridge
+                           loop must NOT send a BYE of its own.
+          "failed"      -- the REFER was rejected or timed out. The call is
+                           still up and the conversation continues."""
         cfg = self.settings
         cseq += 1
         refer_branch = sip.new_branch()
@@ -795,10 +868,15 @@ class CallSession:
                 "message": f"Failed to send transfer request: {e}",
             }
             request.result_event.set()
-            return cseq, False
+            return cseq, "failed"
 
         deadline = time.monotonic() + cfg.transfer_wait_seconds
         refer_accepted = False
+        # True once a NOTIFY reports the referred-to leg alerting (>= 180).
+        # Distinguishes "the PBX BYEd our leg because the transfer is
+        # completing" from "the caller hung up while waiting" -- see the
+        # BYE arm below.
+        refer_progressed = False
         outcome: Optional[str] = None  # "success" | "failed" | None (== timeout)
 
         while time.monotonic() < deadline:
@@ -818,7 +896,15 @@ class CallSession:
                     code, _ = parsed
                     cseq_match = re.search(r"CSeq:\s*(\d+)\s+REFER", msg, re.IGNORECASE)
                     if cseq_match and int(cseq_match.group(1)) == cseq:
-                        if 200 <= code < 300:
+                        if code < 200:
+                            # Provisional. A PBX may well send "100 Trying"
+                            # for an in-dialog REFER before the 202
+                            # Accepted; that means the transaction is alive,
+                            # NOT that it resolved. Treating any non-2xx as
+                            # a rejection here aborted the transfer on the
+                            # very first message such a PBX sent.
+                            self.logger.info(f"REFER provisional response ({code}), still waiting")
+                        elif 200 <= code < 300:
                             refer_accepted = True
                             self.logger.info(f"REFER accepted ({code}), waiting for transfer outcome")
                         else:
@@ -838,28 +924,62 @@ class CallSession:
                 if frag is None:
                     continue
                 frag_code, _ = frag
-                if frag_code == 100:
-                    continue  # trying -- keep waiting for the final fragment
+                if frag_code < 200:
+                    # RFC 3515: the notifier relays the referred-to leg's
+                    # provisional responses -- "100 Trying" first, then
+                    # "180 Ringing" / "183 Session Progress" for as long as
+                    # the extension is alerting. Only a final (>= 200)
+                    # fragment resolves the transfer. Treating everything
+                    # except exactly 100 as final meant every transfer to
+                    # an extension that rings before a human picks up --
+                    # i.e. the normal case -- was recorded as a failure.
+                    if frag_code >= 180:
+                        # The referred-to leg is genuinely alerting. This
+                        # is the evidence the BYE arm below needs to tell a
+                        # completing transfer from a caller hangup.
+                        refer_progressed = True
+                    self.logger.info(f"transfer progress NOTIFY ({frag_code}), still waiting")
+                    continue
                 outcome = "success" if 200 <= frag_code < 300 else "failed"
                 break
             elif method == "BYE":
-                # PBX tore down our leg itself as part of completing the
-                # transfer -- ACK it and treat this as success; no BYE of
-                # our own is needed below.
                 try:
                     self._sock.sendall(sip.build_ok_response(msg).encode())
                 except Exception:
                     pass
-                self._extension_pool.release(request.extension, busy_seconds=cfg.transfer_extension_busy_seconds)
-                self.transferred_to = request.extension
-                self._close_el_session()  # D3: only now, transfer is confirmed
+                if refer_progressed:
+                    # The referred-to leg was alerting or better, so this
+                    # BYE is the PBX tearing our leg down as it completes
+                    # the transfer itself -- no BYE of our own is needed.
+                    self._extension_pool.release(
+                        request.extension, busy_seconds=cfg.transfer_extension_busy_seconds
+                    )
+                    self.transferred_to = request.extension
+                    self._close_el_session()  # D3: only now, transfer is confirmed
+                    request.result = {
+                        "success": True,
+                        "status": "transferred",
+                        "message": f"Call transferred to extension {request.extension}.",
+                    }
+                    request.result_event.set()
+                    return cseq, "transferred"
+                # Nothing ever indicated the referred-to leg progressed, so
+                # the far likelier reading is that the CALLER hung up while
+                # the transfer was pending -- they had just been told to
+                # hold. Recording that as a success wrote Status=Transfer
+                # for a call no human ever took, and quarantined the
+                # extension for TRANSFER_EXTENSION_BUSY_SECONDS over a
+                # transfer that never happened.
+                self.logger.info("caller hung up while the transfer was still pending")
+                self._extension_pool.release(request.extension)
+                self._mark_transfer_failed()
                 request.result = {
-                    "success": True,
-                    "status": "transferred",
-                    "message": f"Call transferred to extension {request.extension}.",
+                    "success": False,
+                    "status": "failed",
+                    "message": "The caller hung up before the transfer completed.",
                 }
                 request.result_event.set()
-                return cseq, True
+                return cseq, "remote_bye"
             elif method in ("OPTIONS", "INFO", "UPDATE"):
                 try:
                     self._sock.sendall(sip.build_ok_response(msg).encode())
@@ -877,21 +997,14 @@ class CallSession:
             self._extension_pool.release(request.extension, busy_seconds=cfg.transfer_extension_busy_seconds)
             self.transferred_to = request.extension
             self._close_el_session()  # D3: only now, transfer is confirmed
-            try:
-                bye_branch = sip.new_branch()
-                cseq += 1
-                self._sock.sendall(
-                    sip.build_bye(**dialog_kwargs, branch=bye_branch, cseq=cseq, remote_tag=remote_tag).encode()
-                )
-            except Exception:
-                pass
+            cseq = self._send_bye(dialog_kwargs=dialog_kwargs, remote_tag=remote_tag, cseq=cseq)
             request.result = {
                 "success": True,
                 "status": "transferred",
                 "message": f"Call transferred to extension {request.extension}.",
             }
             request.result_event.set()
-            return cseq, True
+            return cseq, "transferred"
 
         self._extension_pool.release(request.extension)
         self._mark_transfer_failed()
@@ -901,7 +1014,7 @@ class CallSession:
             "message": f"Transfer to extension {request.extension} failed.",
         }
         request.result_event.set()
-        return cseq, False
+        return cseq, "failed"
 
     @staticmethod
     def _parse_sdp_media_address(sdp_text: str) -> Optional[str]:
@@ -1070,6 +1183,7 @@ class CallSession:
                     self._wait_for_playout(
                         quiet_seconds=cfg.transfer_playout_quiet_seconds,
                         timeout=cfg.transfer_playout_timeout_seconds,
+                        wait_for_start=cfg.transfer_playout_start_timeout_seconds,
                     )
                     acquired_extension = None
                     if self._extension_pool is not None:
@@ -1091,11 +1205,20 @@ class CallSession:
                         break
                     transfer_request.extension = acquired_extension
 
-                cseq, transferred = self._perform_transfer(
+                cseq, transfer_outcome = self._perform_transfer(
                     transfer_request, dialog_kwargs=dialog_kwargs, remote_tag=remote_tag, cseq=cseq
                 )
-                if transferred:
+                if transfer_outcome == "transferred":
                     exit_reason = "transferred"
+                    break
+                if transfer_outcome == "remote_bye":
+                    # The caller hung up mid-transfer. _perform_transfer
+                    # already 200 OK'd their BYE, so fall out of the loop
+                    # WITHOUT sending one of our own -- "remote_bye" is
+                    # deliberately absent from the send-BYE set below. Not
+                    # breaking here would spin the loop until max_duration
+                    # on a dialog that no longer exists.
+                    exit_reason = "remote_bye"
                     break
                 # Failed (REFER rejected/timed out) -- the call continues,
                 # so allow a legitimate retry (e.g. the agent says the
@@ -1155,21 +1278,24 @@ class CallSession:
         if self._hangup_requested.is_set() and exit_reason == "unknown":
             exit_reason = "local_hangup"
 
-        if self._hangup_requested.is_set() or exit_reason in (
-            "max_duration", "rtp_timeout", "local_hangup", "agent_ended", "transfer_unavailable",
+        # Reasons whose dialog is ALREADY torn down. Checked first and
+        # unconditionally, because the `_hangup_requested` disjunct below
+        # otherwise overrides the exclusion: an API hangup landing between
+        # the loop exiting and this line made the condition true regardless
+        # of exit_reason, and out went a stray BYE on a dead dialog.
+        #   "transferred" -- _perform_transfer sent our BYE, or the PBX did.
+        #   "remote_bye"  -- the far end sent the BYE; we answered 200 OK.
+        dialog_already_closed = exit_reason in ("transferred", "remote_bye")
+
+        if not dialog_already_closed and (
+            self._hangup_requested.is_set()
+            or exit_reason in (
+                "max_duration", "rtp_timeout", "local_hangup", "agent_ended", "transfer_unavailable",
+            )
         ):
-            # "transferred" deliberately stays out of this set:
-            # _perform_transfer already sent our BYE (or the PBX sent one
-            # itself), so sending a second one here would be a stray
-            # in-dialog request on a now-dead dialog.
             self.logger.info(f"ending call (reason={exit_reason}), sending BYE")
-            try:
-                bye_branch = sip.new_branch()  # F-14: BYE is its own transaction
-                self._sock.sendall(
-                    sip.build_bye(**dialog_kwargs, branch=bye_branch, cseq=cseq, remote_tag=remote_tag).encode()
-                )
-            except Exception:
-                pass
+            # Return value intentionally dropped: nothing reads cseq after this.
+            self._send_bye(dialog_kwargs=dialog_kwargs, remote_tag=remote_tag, cseq=cseq)
 
         status = (
             CallStatus.COMPLETED
