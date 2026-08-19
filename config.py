@@ -65,6 +65,13 @@ class Settings:
     el_start_timeout_seconds: float = field(default_factory=lambda: _env_float("EL_START_TIMEOUT_SECONDS", 10.0))
     max_auth_attempts: int = field(default_factory=lambda: _env_int("MAX_AUTH_ATTEMPTS", 2))
     cancel_wait_seconds: float = field(default_factory=lambda: _env_float("CANCEL_WAIT_SECONDS", 5.0))
+    # How long to wait for the final response to a BYE before giving up and
+    # closing the socket. The BYE used to be fire-and-forget, so a rejected
+    # one was invisible and could leave our leg up on the PBX -- see
+    # CallSession._await_bye_response.
+    bye_response_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("BYE_RESPONSE_TIMEOUT_SECONDS", 2.0)
+    )
 
     # --- Call transfer (SIP REFER to an internal extension) ---
     # CSV of extensions the agent may blind-transfer a call to, e.g. "201,202,203".

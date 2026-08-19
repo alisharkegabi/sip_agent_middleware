@@ -825,8 +825,66 @@ class CallSession:
                 ).encode()
             )
         except Exception:
-            pass
+            self.logger.exception("failed to send BYE")
+            return cseq
+        self._await_bye_response(cseq)
         return cseq
+
+    def _await_bye_response(self, bye_cseq: int) -> None:
+        """Read the final response to the BYE we just sent, and say plainly
+        in the log whether the PBX accepted it.
+
+        Until this existed the BYE was fire-and-forget: sendall(), return,
+        and _cleanup() closed the TCP socket a moment later. Nothing ever
+        looked at the answer, so a REJECTED BYE -- 481 Call/Transaction Does
+        Not Exist, 500, anything -- was indistinguishable from a clean
+        hangup, and our leg could stay up on the PBX with no trace of why.
+        That is the leading suspect for "the transferred call ended and the
+        customer was left on a silent line": a PBX that held our leg for the
+        transfer will retrieve the caller back onto it when the extension
+        hangs up, and by then we have torn down RTP and gone.
+
+        Waiting is also just correct UAC behaviour (RFC 3261 §15.1.1: the
+        UAC considers the session ended on the final response, not on
+        send). Bounded by BYE_RESPONSE_TIMEOUT_SECONDS so a silent PBX can
+        never hold the call thread.
+        """
+        if self._stream is None:
+            return
+        deadline = time.monotonic() + self.settings.bye_response_timeout_seconds
+        while time.monotonic() < deadline:
+            frame = self._stream.read_message(max(deadline - time.monotonic(), 0.1))
+            if frame.kind == sip.FrameKind.CLOSED:
+                self.logger.warning("SIP connection closed before the BYE was answered")
+                return
+            if frame.kind == sip.FrameKind.TIMEOUT:
+                continue
+
+            msg = frame.text or ""
+            parsed = sip.parse_status_line(msg)
+            if parsed is None:
+                # A request crossing our BYE on the wire. Method only -- the
+                # request line carries the callee's number.
+                self.logger.info(f"in-dialog {sip.parse_method(msg)} arrived while awaiting the BYE response")
+                continue
+
+            code, reason = parsed
+            cseq_match = re.search(r"CSeq:\s*(\d+)\s+BYE", msg, re.IGNORECASE)
+            if not (cseq_match and int(cseq_match.group(1)) == bye_cseq):
+                continue  # a response to some earlier transaction
+            if 200 <= code < 300:
+                self.logger.info(f"BYE accepted ({code}); the PBX has released our leg")
+            else:
+                self.logger.warning(
+                    f"BYE REJECTED ({code} {reason}) -- our leg may still be up on the PBX. "
+                    "This is what leaves a caller on a silent line after a transferred call ends."
+                )
+            return
+
+        self.logger.warning(
+            f"no final response to our BYE within {self.settings.bye_response_timeout_seconds:.1f}s -- "
+            "cannot confirm the PBX released our leg"
+        )
 
     def _perform_transfer(
         self, request: "_TransferRequest", *, dialog_kwargs: dict, remote_tag: str, cseq: int
@@ -986,7 +1044,21 @@ class CallSession:
                 except Exception:
                     pass
                 continue
-            # anything else in-dialog: ignore, keep waiting for the outcome
+            else:
+                # Anything else in-dialog is still ignored, but no longer
+                # SILENTLY. This window is where a PBX puts our leg on hold
+                # for the transfer, and it does that with a re-INVITE --
+                # which this loop does not answer, unlike the main bridge
+                # loop, whose F-14B comment records that unanswered
+                # re-INVITEs make a PBX tear calls down. Whether that is
+                # happening here has never been observable; now it is.
+                # Method/status only: the request line carries the callee's
+                # number.
+                status = sip.parse_status_line(msg)
+                if status is not None:
+                    self.logger.info(f"transfer wait: unhandled response {status[0]}")
+                else:
+                    self.logger.info(f"transfer wait: unhandled in-dialog request {method}")
 
         if outcome is None:
             outcome = "failed"

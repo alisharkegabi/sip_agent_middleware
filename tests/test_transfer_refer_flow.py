@@ -69,6 +69,9 @@ def session(peer, tmp_path):
     settings = Settings()
     # Keep the failure/timeout tests quick.
     object.__setattr__(settings, "transfer_wait_seconds", 2.0)
+    # The fake PBX only answers a BYE in the tests that mean to, so
+    # keep the (real, bounded) wait short everywhere else.
+    object.__setattr__(settings, "bye_response_timeout_seconds", 0.4)
 
     s = CallSession(
         phone_number="+201000000000",
@@ -410,3 +413,115 @@ class TestByeCseq:
         pbx.settimeout(5.0)
         msg = pbx.recv(4096).decode()
         assert _cseq_of(msg, "BYE") > refer_cseq, "BYE reused the REFER's CSeq"
+
+
+def _response_for(method: str, code: int, reason: str, cseq: int) -> bytes:
+    """A final response for an arbitrary in-dialog transaction."""
+    return (
+        f"SIP/2.0 {code} {reason}\r\n"
+        f"Via: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4bKtest\r\n"
+        f"From: <sip:9999@127.0.0.1>;tag=local\r\n"
+        f"To: <sip:+201000000000@127.0.0.1>;tag=pbx1\r\n"
+        f"Call-ID: test-call-id\r\n"
+        f"CSeq: {cseq} {method}\r\n"
+        f"Content-Length: 0\r\n"
+        f"\r\n"
+    ).encode()
+
+
+def _reinvite() -> bytes:
+    """What a PBX sends to put our leg on hold while it runs the transfer."""
+    sdp = (
+        "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\n"
+        "t=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=sendonly\r\n"
+    )
+    return (
+        f"INVITE sip:9999@127.0.0.1 SIP/2.0\r\n"
+        f"Via: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4bKreinv\r\n"
+        f"From: <sip:+201000000000@127.0.0.1>;tag=pbx1\r\n"
+        f"To: <sip:9999@127.0.0.1>;tag=local\r\n"
+        f"Call-ID: test-call-id\r\n"
+        f"CSeq: 7 INVITE\r\n"
+        f"Content-Type: application/sdp\r\n"
+        f"Content-Length: {len(sdp)}\r\n"
+        f"\r\n"
+        f"{sdp}"
+    ).encode()
+
+
+class TestByeResponseIsObserved:
+    """The BYE used to be fire-and-forget: sendall(), return, and _cleanup()
+    closed the socket. A REJECTED BYE was therefore indistinguishable from a
+    clean hangup, and our leg could stay up on the PBX with nothing in the
+    log to say so -- the leading suspect for a caller left on a silent line
+    after the transferred call ends."""
+
+    def test_accepted_bye_is_recorded(self, session, peer, caplog):
+        _, pbx = peer
+        with caplog.at_level("INFO"):
+            import threading as _t
+            done = _t.Event()
+
+            def _go():
+                session._send_bye(
+                    dialog_kwargs=_dialog_kwargs(session), remote_tag=";tag=pbx1", cseq=10
+                )
+                done.set()
+
+            _t.Thread(target=_go).start()
+            msg = pbx.recv(4096).decode()
+            pbx.sendall(_response_for("BYE", 200, "OK", _cseq_of(msg, "BYE")))
+            assert done.wait(timeout=5)
+
+        assert "BYE accepted (200)" in caplog.text
+
+    def test_rejected_bye_is_surfaced_as_a_warning(self, session, peer, caplog):
+        """481 means the PBX has no such dialog -- our leg is NOT released
+        by this BYE, and the operator needs to see that."""
+        _, pbx = peer
+        with caplog.at_level("INFO"):
+            import threading as _t
+            done = _t.Event()
+
+            def _go():
+                session._send_bye(
+                    dialog_kwargs=_dialog_kwargs(session), remote_tag=";tag=pbx1", cseq=10
+                )
+                done.set()
+
+            _t.Thread(target=_go).start()
+            msg = pbx.recv(4096).decode()
+            pbx.sendall(
+                _response_for("BYE", 481, "Call/Transaction Does Not Exist", _cseq_of(msg, "BYE"))
+            )
+            assert done.wait(timeout=5)
+
+        assert "BYE REJECTED (481" in caplog.text
+        assert any(r.levelname == "WARNING" for r in caplog.records)
+
+    def test_silent_pbx_is_surfaced_and_bounded(self, session, peer, caplog):
+        _, pbx = peer
+        with caplog.at_level("INFO"):
+            session._send_bye(
+                dialog_kwargs=_dialog_kwargs(session), remote_tag=";tag=pbx1", cseq=10
+            )
+        assert "no final response to our BYE" in caplog.text
+
+
+class TestUnhandledMessagesDuringTransferAreVisible:
+    def test_reinvite_during_the_refer_wait_is_logged(self, session, peer, caplog):
+        """A PBX holds our leg with a re-INVITE while it runs the transfer.
+        This loop does not answer one -- unlike the main bridge loop, whose
+        F-14B comment records that unanswered re-INVITEs make a PBX tear
+        calls down. It is at least no longer invisible."""
+        _, pbx = peer
+        with caplog.at_level("INFO"):
+            run = _run_transfer(session)
+            cseq = _refer_cseq(_read_refer(pbx))
+            pbx.sendall(_response_for("REFER", 202, "Accepted", cseq))
+            pbx.sendall(_reinvite())
+            pbx.sendall(_notify(200, "OK"))
+            run["thread"].join(timeout=10)
+
+        assert run["outcome"] == "transferred"
+        assert "unhandled in-dialog request INVITE" in caplog.text
