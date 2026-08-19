@@ -50,6 +50,17 @@ from port_allocator import PortAllocator
 from transfer_trigger import matches_transfer_phrase
 
 
+def _read_conversation_id(conversation) -> Optional[str]:
+    """Best-effort read of the id populated early by the ElevenLabs SDK."""
+    try:
+        conversation_id = getattr(conversation, "_conversation_id", None)
+        return str(conversation_id) if conversation_id else None
+    except Exception:
+        # This is a private SDK seam. A renamed property or unusual SDK value
+        # must degrade to a missing id, never interrupt the live SIP call.
+        return None
+
+
 @dataclass
 class _TransferRequest:
     """Handoff between whichever thread requested a transfer (the
@@ -102,6 +113,7 @@ class CallSession:
         self._transfer_started = False   # one-shot: at most ONE transfer attempt per call
         self._transfer_failed = False    # D6: an announced transfer that never completed
         self._el_session_closed = False  # makes _close_el_session() idempotent
+        self._conversation_id_missing_warned = False
         self._busy_frames = busy_frames  # pre-built mu-law frames, or None if unavailable
 
         # Stable for the whole dialog (RFC 3261): Call-ID and From tag.
@@ -163,6 +175,45 @@ class CallSession:
         session state (F-24)."""
         with self._status_lock:
             self.analysis = analysis
+
+    def _capture_conversation_id(self) -> None:
+        """Capture the SDK's early conversation id without risking call flow."""
+        if self.conversation_id:
+            return
+
+        conversation = self._conversation
+        if conversation is None:
+            return
+
+        try:
+            attribute_missing = not hasattr(conversation, "_conversation_id")
+            conversation_id = _read_conversation_id(conversation)
+        except Exception:
+            # This runs on every bridge tick against a private SDK seam. A
+            # descriptor that raises must not escape into the SIP thread and
+            # terminate an otherwise healthy call.
+            return
+
+        if attribute_missing:
+            if not self._conversation_id_missing_warned:
+                self._conversation_id_missing_warned = True
+                self.logger.warning(
+                    "ElevenLabs Conversation has no _conversation_id attribute; "
+                    "the SDK renamed it and post-call analysis will be lost"
+                )
+            return
+        if not conversation_id:
+            return
+
+        captured = False
+        # F-24: to_dict()/to_webhook_payload() read under _status_lock, so
+        # every writer -- including this SIP-thread early capture -- must use it.
+        with self._status_lock:
+            if not self.conversation_id:
+                self.conversation_id = conversation_id
+                captured = True
+        if captured:
+            self.logger.info(f"captured ElevenLabs conversation_id={conversation_id}")
 
     def _set_status(self, status: CallStatus, error: Optional[str] = None) -> None:
         with self._status_lock:
@@ -1211,7 +1262,11 @@ class CallSession:
             while True:
                 try:
                     conversation_id = self._conversation.wait_for_session_end()
-                    self.conversation_id = conversation_id
+                    # F-24: this remains a fallback writer for agent-ended
+                    # calls, but must not overwrite an id captured in-loop.
+                    with self._status_lock:
+                        if not self.conversation_id and conversation_id:
+                            self.conversation_id = str(conversation_id)
                     break
                 except Exception:
                     self.logger.exception("el-wait thread error, retrying")
@@ -1229,6 +1284,8 @@ class CallSession:
         cseq = next_cseq
 
         while not session_ended.is_set() and not self._hangup_requested.is_set():
+            self._capture_conversation_id()
+
             if time.monotonic() >= call_deadline:
                 exit_reason = "max_duration"
                 break
@@ -1381,6 +1438,9 @@ class CallSession:
 
     # ------------------------------------------------------------------
     def _cleanup(self) -> None:
+        # Last-chance capture before closing and dropping the live SDK object:
+        # metadata may have arrived during the bridge loop's final tick.
+        self._capture_conversation_id()
         self.logger.info("cleaning up call resources")
         try:
             # Idempotent + bounded (see _close_el_session): a transfer may
