@@ -3,8 +3,12 @@
 Writes call lifecycle timestamps and status to a SQL Server table,
 `dbo.BatchCallDetails`, keyed by `TrackingId` (the `tracking_id` carried in
 a call's `dynamic_variables`). Four new PascalCase columns are written:
-`RingingAt`, `AnsweredAt`, `EndedAt` (all `datetime`), and `Status`
+`RingAt`, `AnsweredAt`, `EndedAt` (all `datetime`), and `Status`
 (`nvarchar(20)`, confirmed live via `INFORMATION_SCHEMA.COLUMNS`).
+
+The row itself is created by the .NET client — every statement in `db.py`
+is an `UPDATE`, never an `INSERT`. See "The RingAt race" below for what
+that costs.
 
 ## Status values (PascalCase strings)
 
@@ -61,6 +65,59 @@ The check order matters and is intentional:
 
 See `tests/test_call_status_mapping.py` for the full decision table exercised
 against every row.
+
+## The RingAt race
+
+Symptom: rows with `RingAt` NULL but `AnsweredAt`, `EndedAt` and `Status`
+all populated — the ringing write silently missing on an otherwise complete,
+answered call, intermittently, with nothing in `service.log`.
+
+Cause, measured over the 73 answered calls in `logs/service.log`:
+
+| Write | Fires after `POST /calls` is accepted |
+|---|---|
+| `mark_ringing` | median **131 ms**, min **7 ms** |
+| `mark_answered` | min **3.504 s** (ring time — it cannot be earlier) |
+
+`CallManager.submit_call()` hands the session to the executor *before* the
+HTTP response is returned (`call_manager.py:145`), so the SIP thread is
+already dialling and writing `RingAt` while the .NET client is still waiting
+on its 200. If the client creates the row any time inside that ~3.4 s window,
+`mark_ringing` updates **zero rows** and every later write lands.
+
+A 0-row `UPDATE` is not an error — it commits and raises nothing — and the
+original code discarded `cursor.rowcount`, so the miss was indistinguishable
+from success.
+
+**Fix.** `_execute()` returns the rowcount. `mark_ringing` schedules a
+backfill on a daemon `threading.Timer` when it gets 0 (delays in
+`RING_BACKFILL_DELAYS`, currently 2 s / 5 s / 15 s, then it gives up with a
+warning). Retries are off-thread by necessity: `mark_ringing` runs on the SIP
+thread that is about to read the PBX's response to the INVITE, so sleeping
+inline would delay answer detection. `mark_answered` and `mark_ended` log a
+warning on 0 rows but do not retry — they fire late enough that the row
+always exists.
+
+The backfill statement is guarded twice so it is safe to run seconds late and
+more than once:
+
+```sql
+UPDATE dbo.BatchCallDetails
+   SET RingAt = ?,
+       Status = CASE WHEN AnsweredAt IS NULL AND EndedAt IS NULL
+                     THEN ? ELSE Status END
+ WHERE TrackingId = ? AND RingAt IS NULL
+```
+
+`RingAt IS NULL` makes it idempotent; the `CASE` stops a retry that fires
+after the call was answered from dragging `Status` back to `Ringing`. The
+timestamp written is the original ring time, not the retry time.
+
+Covered by `tests/test_ring_backfill.py`.
+
+**The real fix is on the .NET side**: insert and commit the
+`BatchCallDetails` row *before* calling `POST /calls`. The backfill is a
+mitigation for a row that arrives late, not a licence for it to arrive late.
 
 ## Files changed
 
@@ -135,7 +192,7 @@ SQL_PWD=<password>
 ## Required action outside this repo
 
 `dbo.BatchCallDetails` needs the four new columns added:
-`RingingAt datetime`, `AnsweredAt datetime`, `EndedAt datetime`, `Status
+`RingAt datetime`, `AnsweredAt datetime`, `EndedAt datetime`, `Status
 nvarchar(...)`. The existing `TrackingId` column is used as-is to find the
 row to update.
 
