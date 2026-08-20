@@ -946,6 +946,25 @@ class CallSession:
             "cannot confirm the PBX released our leg"
         )
 
+    def _redact_callee(self, text: str) -> str:
+        """Strip the customer's number out of anything about to be logged.
+        The REFER's request line and its To header both carry it -- which is
+        why the transfer path used to log methods and status codes only."""
+        if not self.phone_number:
+            return text
+        return text.replace(self.phone_number, "<callee>")
+
+    def _trace_sip(self, label: str, text: str) -> None:
+        """One-line dump of a SIP message on the transfer path (config:
+        TRANSFER_SIP_TRACE). Exists because a transfer to an off-net number
+        and a transfer to an internal extension produce identical logs right
+        up to the outcome, and the one thing that distinguishes them -- the
+        sipfrag in the NOTIFY body -- was never written down anywhere."""
+        if not self.settings.transfer_sip_trace:
+            return
+        flat = " | ".join(line for line in self._redact_callee(text).split("\r\n") if line)
+        self.logger.info(f"sip trace [{label}] {flat}")
+
     def _perform_transfer(
         self, request: "_TransferRequest", *, dialog_kwargs: dict, remote_tag: str, cseq: int
     ) -> tuple[int, str]:
@@ -967,16 +986,17 @@ class CallSession:
         refer_branch = sip.new_branch()
         self.logger.info(f"transferring call to extension {request.extension} via SIP REFER")
 
+        refer_text = sip.build_refer(
+            **dialog_kwargs,
+            branch=refer_branch,
+            cseq=cseq,
+            refer_to_extension=request.extension,
+            remote_tag=remote_tag,
+        )
+        self._trace_sip("REFER out", refer_text)
+
         try:
-            self._sock.sendall(
-                sip.build_refer(
-                    **dialog_kwargs,
-                    branch=refer_branch,
-                    cseq=cseq,
-                    refer_to_extension=request.extension,
-                    remote_tag=remote_tag,
-                ).encode()
-            )
+            self._sock.sendall(refer_text.encode())
         except Exception as e:
             self._extension_pool.release(request.extension)
             self._mark_transfer_failed()
@@ -1027,12 +1047,14 @@ class CallSession:
                             self.logger.info(f"REFER accepted ({code}), waiting for transfer outcome")
                         else:
                             outcome = "failed"
+                            self._trace_sip("REFER rejected", msg)
                             self.logger.info(f"REFER rejected: {first_line}")
                             break
                     continue
 
             method = sip.parse_method(msg)
             if method == "NOTIFY" and "refer" in msg.lower():
+                self._trace_sip("NOTIFY in", msg)
                 try:
                     self._sock.sendall(sip.build_ok_response(msg).encode())
                 except Exception:
@@ -1040,8 +1062,11 @@ class CallSession:
                 body = msg.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in msg else ""
                 frag = sip.parse_status_line(body.strip())
                 if frag is None:
+                    # Skipped silently before, which left the transfer
+                    # looking like it was simply still waiting.
+                    self.logger.info("refer NOTIFY carried no parseable sipfrag status line")
                     continue
-                frag_code, _ = frag
+                frag_code, frag_reason = frag
                 if frag_code < 200:
                     # RFC 3515: the notifier relays the referred-to leg's
                     # provisional responses -- "100 Trying" first, then
@@ -1056,11 +1081,21 @@ class CallSession:
                         # is the evidence the BYE arm below needs to tell a
                         # completing transfer from a caller hangup.
                         refer_progressed = True
-                    self.logger.info(f"transfer progress NOTIFY ({frag_code}), still waiting")
+                    self.logger.info(
+                        f"transfer progress NOTIFY ({frag_code} {frag_reason}), still waiting"
+                    )
                     continue
+                # The single most diagnostic line on this path: it is the
+                # PBX's own verdict on the referred-to leg, and until now it
+                # was consumed as a number and thrown away.
+                self.logger.info(f"transfer final NOTIFY sipfrag: {frag_code} {frag_reason}")
                 outcome = "success" if 200 <= frag_code < 300 else "failed"
                 break
             elif method == "BYE":
+                # Carries a Reason header on most PBXs -- says who tore the
+                # leg down and why, which is the other half of a transfer
+                # that "succeeded" and still dropped the caller.
+                self._trace_sip("BYE in", msg)
                 try:
                     self._sock.sendall(sip.build_ok_response(msg).encode())
                 except Exception:
@@ -1112,8 +1147,9 @@ class CallSession:
                 # loop, whose F-14B comment records that unanswered
                 # re-INVITEs make a PBX tear calls down. Whether that is
                 # happening here has never been observable; now it is.
-                # Method/status only: the request line carries the callee's
-                # number.
+                # Full text is safe to log now that _redact_callee strips
+                # the callee number the request line carries.
+                self._trace_sip("unhandled", msg)
                 status = sip.parse_status_line(msg)
                 if status is not None:
                     self.logger.info(f"transfer wait: unhandled response {status[0]}")

@@ -86,6 +86,14 @@ class Settings:
     transfer_extension_busy_seconds: float = field(
         default_factory=lambda: _env_float("TRANSFER_EXTENSION_BUSY_SECONDS", 300.0)
     )
+    # Log the REFER we send and every REFER-related SIP message we get back
+    # during the transfer wait, callee number redacted. The reason an
+    # off-net transfer fails lives only in the NOTIFY body (RFC 3515
+    # message/sipfrag), which _perform_transfer used to parse for its status
+    # code and then discard -- making "404 Not Found" and "200 OK"
+    # indistinguishable in the log. On by default; it is a handful of lines
+    # per transfer, and transfers are rare.
+    transfer_sip_trace: bool = field(default_factory=lambda: _env_bool("TRANSFER_SIP_TRACE", True))
 
     # Phrase the agent speaks to trigger an internal transfer. Detection is
     # on the agent's own transcript (CallSession._maybe_trigger_transfer,
