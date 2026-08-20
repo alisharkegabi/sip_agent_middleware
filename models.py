@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, field_validator
 # F-23: phone numbers are interpolated directly into a SIP request line and
 # headers; a value containing \r\n would permit SIP header injection. This
 # is deliberately conservative (E.164-ish digits, optional leading +).
-_PHONE_RE = re.compile(r"^\+?[0-9]{6,15}$")
+_PHONE_RE = re.compile(r"^\+?[0-9]{3,15}$")
 
 
 class CallStatus(str, Enum):

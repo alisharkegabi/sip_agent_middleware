@@ -9,6 +9,7 @@ the same pattern as config.py -- never hardcode credentials here.
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -16,7 +17,11 @@ from typing import Optional
 import pyodbc
 from dotenv import load_dotenv
 
+from logging_config import get_logger
+
 load_dotenv(override=True)
+
+logger = get_logger("db")
 
 
 def _env_str(name: str, default: str) -> str:
@@ -46,6 +51,18 @@ STATUS_TRANSFER_FAILED = "TranFail"  # transfer was announced but never complete
 # SIP final responses that mean the callee/PBX rejected or cancelled the dialog.
 _CANCELLED_SIP_CODES = {486, 503}
 
+# The BatchCallDetails row is created by the .NET client, not by us -- every
+# function here is an UPDATE that assumes the row already exists. It does not
+# always exist yet: measured over 73 answered calls, mark_ringing fires a
+# median of 131 ms (min 7 ms) after POST /calls is accepted, because
+# CallManager.submit_call hands the session to the executor before the HTTP
+# response is even returned. mark_answered cannot fire before 3.5 s (ring
+# time). So there is a ~3.4 s window in which the ringing UPDATE matches zero
+# rows -- silently, since a 0-row UPDATE is not an error -- while every later
+# write lands. That is what produced rows with RingAt NULL but AnsweredAt,
+# EndedAt and Status all set. These delays backfill RingAt once the row shows up.
+RING_BACKFILL_DELAYS = (2.0, 5.0, 15.0)
+
 
 def get_connection() -> pyodbc.Connection:
     """Open a new connection to the BatchCallDetails database."""
@@ -59,6 +76,32 @@ def get_connection() -> pyodbc.Connection:
     )
 
 
+def _execute(sql: str, *params) -> int:
+    """Run one statement and return the number of rows it affected.
+
+    The rowcount is the whole point: an UPDATE whose WHERE clause matches
+    nothing commits happily and raises nothing, so without checking it a
+    missed write is indistinguishable from a successful one.
+    """
+    conn = get_connection()
+    try:
+        cursor = conn.execute(sql, *params)
+        affected = cursor.rowcount
+        conn.commit()
+        return affected
+    finally:
+        conn.close()
+
+
+def _warn_if_missing(affected: int, tracking_id: str, what: str) -> None:
+    """A 0-row UPDATE raises nothing; say so rather than letting it vanish."""
+    if affected == 0:
+        logger.warning(
+            f"{what}: no BatchCallDetails row matched TrackingId {tracking_id} "
+            "(0 rows updated)"
+        )
+
+
 def sip_response_to_status(sip_code: int) -> Optional[str]:
     """Map a SIP final-response code to a terminal Status value, if applicable."""
     if sip_code in _CANCELLED_SIP_CODES:
@@ -67,35 +110,85 @@ def sip_response_to_status(sip_code: int) -> Optional[str]:
 
 
 def mark_ringing(tracking_id: str, ringing_at: Optional[datetime] = None) -> None:
-    """Record that the callee started ringing (180 Ringing received)."""
+    """Record that the callee started ringing (180 Ringing received).
+
+    If the row does not exist yet (see RING_BACKFILL_DELAYS), the write is
+    retried off-thread rather than lost. Retries never sleep the caller --
+    this runs on the SIP thread that is about to read the PBX's response to
+    the INVITE, so blocking here would delay answer detection.
+    """
     ringing_at = ringing_at or datetime.now(timezone.utc)
-    conn = get_connection()
+    affected = _execute(
+        "UPDATE dbo.BatchCallDetails SET RingAt = ?, Status = ? WHERE TrackingId = ?",
+        ringing_at,
+        STATUS_RINGING,
+        tracking_id,
+    )
+    if affected == 0:
+        _schedule_ring_backfill(tracking_id, ringing_at, 0)
+
+
+def _schedule_ring_backfill(tracking_id: str, ringing_at: datetime, attempt: int) -> None:
+    """Arrange another attempt at the RingAt write, on a daemon Timer."""
+    if attempt >= len(RING_BACKFILL_DELAYS):
+        logger.warning(
+            f"RingAt never recorded for TrackingId {tracking_id}: no matching "
+            f"BatchCallDetails row after {len(RING_BACKFILL_DELAYS)} retries"
+        )
+        return
+    timer = threading.Timer(
+        RING_BACKFILL_DELAYS[attempt],
+        lambda: _backfill_ringing(tracking_id, ringing_at, attempt),
+    )
+    timer.daemon = True
+    timer.start()
+
+
+def _backfill_ringing(tracking_id: str, ringing_at: datetime, attempt: int) -> None:
+    """Set RingAt on a row that did not exist when the call started ringing.
+
+    Two guards make this safe to run late and more than once:
+
+    * `WHERE RingAt IS NULL` -- idempotent, and it never overwrites a RingAt
+      some earlier attempt already landed.
+    * The CASE on Status -- by the time a retry fires the call has very
+      likely been answered, and Status is 'Answered'. Writing 'Ringing'
+      unconditionally would drag the row backwards into a state the call has
+      already left, so Status is only set when nothing later has happened.
+    """
     try:
-        conn.execute(
-            "UPDATE dbo.BatchCallDetails SET RingAt = ?, Status = ? WHERE TrackingId = ?",
+        affected = _execute(
+            "UPDATE dbo.BatchCallDetails "
+            "SET RingAt = ?, "
+            "    Status = CASE WHEN AnsweredAt IS NULL AND EndedAt IS NULL "
+            "                  THEN ? ELSE Status END "
+            "WHERE TrackingId = ? AND RingAt IS NULL",
             ringing_at,
             STATUS_RINGING,
             tracking_id,
         )
-        conn.commit()
-    finally:
-        conn.close()
+    except Exception:
+        logger.exception(f"RingAt backfill failed for TrackingId {tracking_id}")
+        _schedule_ring_backfill(tracking_id, ringing_at, attempt + 1)
+        return
+    if affected == 0:
+        _schedule_ring_backfill(tracking_id, ringing_at, attempt + 1)
+    else:
+        logger.info(
+            f"RingAt backfilled for TrackingId {tracking_id} on retry {attempt + 1}"
+        )
 
 
 def mark_answered(tracking_id: str, answered_at: Optional[datetime] = None) -> None:
     """Record that the call was answered (200 OK to INVITE received)."""
     answered_at = answered_at or datetime.now(timezone.utc)
-    conn = get_connection()
-    try:
-        conn.execute(
-            "UPDATE dbo.BatchCallDetails SET AnsweredAt = ?, Status = ? WHERE TrackingId = ?",
-            answered_at,
-            STATUS_ANSWERED,
-            tracking_id,
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    affected = _execute(
+        "UPDATE dbo.BatchCallDetails SET AnsweredAt = ?, Status = ? WHERE TrackingId = ?",
+        answered_at,
+        STATUS_ANSWERED,
+        tracking_id,
+    )
+    _warn_if_missing(affected, tracking_id, "mark_answered")
 
 
 def mark_ended(
@@ -116,21 +209,17 @@ def mark_ended(
     is set.
     """
     ended_at = ended_at or datetime.now(timezone.utc)
-    conn = get_connection()
-    try:
-        if status is not None:
-            conn.execute(
-                "UPDATE dbo.BatchCallDetails SET EndedAt = ?, Status = ? WHERE TrackingId = ?",
-                ended_at,
-                status,
-                tracking_id,
-            )
-        else:
-            conn.execute(
-                "UPDATE dbo.BatchCallDetails SET EndedAt = ? WHERE TrackingId = ?",
-                ended_at,
-                tracking_id,
-            )
-        conn.commit()
-    finally:
-        conn.close()
+    if status is not None:
+        affected = _execute(
+            "UPDATE dbo.BatchCallDetails SET EndedAt = ?, Status = ? WHERE TrackingId = ?",
+            ended_at,
+            status,
+            tracking_id,
+        )
+    else:
+        affected = _execute(
+            "UPDATE dbo.BatchCallDetails SET EndedAt = ? WHERE TrackingId = ?",
+            ended_at,
+            tracking_id,
+        )
+    _warn_if_missing(affected, tracking_id, "mark_ended")
