@@ -44,7 +44,7 @@ import db
 import sip_protocol as sip
 from audio_bridge import RtpAudioInterface
 from config import Settings
-from extension_pool import ExtensionPool, ExtensionPoolExhausted
+from transfer_targets import TransferTargets
 from logging_config import get_call_logger
 from models import CallStatus
 from port_allocator import PortAllocator
@@ -70,10 +70,10 @@ class _TransferRequest:
     the HTTP fallback) and the SIP thread running _bridge()'s loop -- the
     only thread allowed to touch self._sock / self._stream. The requesting
     thread blocks on result_event; the bridge loop picks the request off
-    the queue, acquires an extension itself (extension starts as None for
+    the queue, chooses the target itself (extension starts as None for
     every entry point now -- see CallSession._request_transfer /
     _maybe_trigger_transfer), does the REFER, and sets the result."""
-    extension: Optional[str] = None   # None => the SIP thread acquires it
+    extension: Optional[str] = None   # None => the SIP thread chooses it
     source: str = "agent_phrase"      # "agent_phrase" | "client_tool" | "http"
     result_event: threading.Event = field(default_factory=threading.Event)
     result: Optional[dict] = None
@@ -87,7 +87,7 @@ class CallSession:
         dynamic_variables: dict,
         settings: Settings,
         port_allocator: PortAllocator,
-        extension_pool: Optional[ExtensionPool] = None,
+        transfer_targets: Optional[TransferTargets] = None,
         tracking_id: Optional[str] = None,
         speech_dynamic_variables: Optional[dict] = None,
         busy_frames: Optional[list] = None,
@@ -106,7 +106,7 @@ class CallSession:
         self.tracking_id = tracking_id or dynamic_variables.get("tracking_id")
         self.settings = settings
         self._port_allocator = port_allocator
-        self._extension_pool = extension_pool
+        self._transfer_targets = transfer_targets
         self.logger = get_call_logger(self.call_id)
         self.conversation_id = None
         # Filled in after the call by AnalysisFetcher (evaluation criteria +
@@ -116,7 +116,7 @@ class CallSession:
         self._transfer_requests: "queue.Queue[_TransferRequest]" = queue.Queue()
 
         # Per-call transfer state. Everything here lives on self -- the only
-        # shared object across calls is ExtensionPool, which is internally
+        # shared object across calls is TransferTargets, which is internally
         # locked -- which is what structurally prevents one call's trigger
         # phrase (or its transfer outcome) from ever touching another call.
         self._transfer_guard = threading.Lock()
@@ -768,9 +768,9 @@ class CallSession:
     def _request_transfer(self, *, source: str) -> dict:
         """Shared body for every transfer entry point (agent phrase, client
         tool, HTTP fallback). Claims the one-shot guard, enqueues a request
-        for the SIP thread -- which alone may acquire an extension and send
-        SIP, so "all lines busy" behaves identically no matter which entry
-        point triggered it -- and blocks for the outcome. The dict returned
+        for the SIP thread -- which alone may choose the target and send
+        SIP, so a transfer behaves identically no matter which entry point
+        triggered it -- and blocks for the outcome. The dict returned
         here becomes the client_tool_result the agent sees (for the
         "agent_phrase" and "client_tool" sources) or the HTTP response body
         (for "http")."""
@@ -1052,7 +1052,6 @@ class CallSession:
                 ).encode()
             )
         except Exception as e:
-            self._extension_pool.release(request.extension)
             self._mark_transfer_failed()
             request.result = {
                 "success": False,
@@ -1143,9 +1142,6 @@ class CallSession:
                     # The referred-to leg was alerting or better, so this
                     # BYE is the PBX tearing our leg down as it completes
                     # the transfer itself -- no BYE of our own is needed.
-                    self._extension_pool.release(
-                        request.extension, busy_seconds=cfg.transfer_extension_busy_seconds
-                    )
                     self.transferred_to = request.extension
                     self._close_el_session()  # D3: only now, transfer is confirmed
                     request.result = {
@@ -1159,11 +1155,8 @@ class CallSession:
                 # the far likelier reading is that the CALLER hung up while
                 # the transfer was pending -- they had just been told to
                 # hold. Recording that as a success wrote Status=Transfer
-                # for a call no human ever took, and quarantined the
-                # extension for TRANSFER_EXTENSION_BUSY_SECONDS over a
-                # transfer that never happened.
+                # for a call no human ever took.
                 self.logger.info("caller hung up while the transfer was still pending")
-                self._extension_pool.release(request.extension)
                 self._mark_transfer_failed()
                 request.result = {
                     "success": False,
@@ -1200,7 +1193,6 @@ class CallSession:
 
         if outcome == "success":
             self.logger.info(f"call transferred to extension {request.extension}, ending our leg")
-            self._extension_pool.release(request.extension, busy_seconds=cfg.transfer_extension_busy_seconds)
             self.transferred_to = request.extension
             self._close_el_session()  # D3: only now, transfer is confirmed
             cseq = self._send_bye(dialog_kwargs=dialog_kwargs, remote_tag=remote_tag, cseq=cseq)
@@ -1212,7 +1204,6 @@ class CallSession:
             request.result_event.set()
             return cseq, "transferred"
 
-        self._extension_pool.release(request.extension)
         self._mark_transfer_failed()
         request.result = {
             "success": False,
@@ -1388,36 +1379,47 @@ class CallSession:
             if transfer_request is not None:
                 if transfer_request.extension is None:
                     # Every entry point (agent phrase, client tool, HTTP)
-                    # arrives here with no extension yet -- acquisition
-                    # happens on the SIP thread, in one place, so "all
-                    # lines busy" behaves identically no matter what
-                    # triggered the transfer. First let whatever was just
-                    # said (the trigger phrase itself) finish reaching the
-                    # caller.
+                    # arrives here with no target yet -- the choice happens
+                    # on the SIP thread, in one place, so a transfer
+                    # behaves identically no matter what triggered it.
+                    # First let whatever was just said (the trigger phrase
+                    # itself) finish reaching the caller.
                     self._wait_for_playout(
                         quiet_seconds=cfg.transfer_playout_quiet_seconds,
                         timeout=cfg.transfer_playout_timeout_seconds,
                         wait_for_start=cfg.transfer_playout_start_timeout_seconds,
                     )
-                    acquired_extension = None
-                    if self._extension_pool is not None:
-                        try:
-                            acquired_extension = self._extension_pool.acquire()
-                        except ExtensionPoolExhausted:
-                            acquired_extension = None
-                    if acquired_extension is None:
-                        self.logger.info("transfer requested but no extensions are available")
+                    # The target is a PBX queue: it holds callers, it does
+                    # not fill up, and this service has no visibility into
+                    # its real state anyway. So the REFER always goes out
+                    # and the PBX's own response decides the outcome -- see
+                    # transfer_targets.py for the model this replaced and
+                    # the failure it caused.
+                    target = (
+                        self._transfer_targets.next_target()
+                        if self._transfer_targets is not None
+                        else None
+                    )
+                    if target is None:
+                        # Nothing configured at all. Not a busy queue -- a
+                        # misconfigured service -- but the caller has just
+                        # been told they are being transferred, so they get
+                        # the prompt rather than silence and a BYE.
+                        self.logger.error(
+                            "transfer requested but no transfer targets are configured "
+                            "(TRANSFER_EXTENSIONS is empty)"
+                        )
                         transfer_request.result = {
                             "success": False,
                             "status": "busy",
-                            "message": "All lines are currently busy.",
+                            "message": "No transfer target is configured.",
                         }
                         transfer_request.result_event.set()
                         self._mark_transfer_failed()
                         self._play_busy_prompt_and_close()
                         exit_reason = "transfer_unavailable"
                         break
-                    transfer_request.extension = acquired_extension
+                    transfer_request.extension = target
 
                 cseq, transfer_outcome = self._perform_transfer(
                     transfer_request, dialog_kwargs=dialog_kwargs, remote_tag=remote_tag, cseq=cseq

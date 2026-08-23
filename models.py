@@ -106,8 +106,13 @@ class HealthResponse(BaseModel):
     total_failed: int
     rtp_ports_free: int
     rtp_ports_in_use: int
-    transfer_extensions_free: int = 0
-    transfer_extensions_in_use: int = 0
+    # Replaced transfer_extensions_free / transfer_extensions_in_use, which
+    # described a pool that no longer exists. The transfer target is a PBX
+    # queue -- never "in use", never exhausted -- so the only fact worth
+    # reporting is whether one is configured. Both old fields are dropped
+    # rather than pinned at 0: a client reading 0 free extensions would
+    # conclude transfers are down when they are working normally.
+    transfer_targets_configured: int = 0
     uptime_seconds: float
     # F-19 observability
     queue_depth: int = 0

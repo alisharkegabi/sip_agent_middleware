@@ -28,10 +28,18 @@ were added alongside the phrase-triggered internal transfer feature — see
   SIP REFER completed successfully; the caller landed on a human extension
   (`exit_reason == "transferred"`).
 - `TranFail` — the agent **announced** a transfer (said the trigger phrase)
-  and it did **not** complete, for any reason: no extension was free
-  (`exit_reason == "transfer_unavailable"`, caller heard the "all lines
-  busy" prompt), or the PBX rejected/timed out the REFER and the call
-  continued normally afterward. The short spelling is deliberate — both new
+  and it did **not** complete, for any reason: the PBX rejected or timed out
+  the REFER and the call continued normally afterward, the caller hung up
+  while the transfer was pending, or `TRANSFER_EXTENSIONS` was empty so no
+  REFER could be sent at all (`exit_reason == "transfer_unavailable"`,
+  caller heard the "all lines busy" prompt).
+
+  > **The "no extension was free" cause is gone.** The transfer target is a
+  > PBX queue, which holds callers rather than filling up, so this service
+  > no longer refuses a transfer on its own judgement — see
+  > `TRANSFER_FEATURE.md` § "Why there is no busy path". `transfer_unavailable`
+  > now means only "nothing configured to transfer to", which is a
+  > deployment fault and should be zero rows in practice. The short spelling is deliberate — both new
   values fit the existing `nvarchar(20)` column with room to spare, no
   schema change needed. This status exists because the caller was told
   "we'll transfer you now" and it didn't happen (or, for the busy case, was

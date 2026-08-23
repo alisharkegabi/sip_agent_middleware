@@ -73,19 +73,15 @@ class Settings:
         default_factory=lambda: _env_float("BYE_RESPONSE_TIMEOUT_SECONDS", 2.0)
     )
 
-    # --- Call transfer (SIP REFER to an internal extension) ---
-    # CSV of extensions the agent may blind-transfer a call to, e.g. "201,202,203".
+    # --- Call transfer (SIP REFER to a PBX queue / hotline number) ---
+    # CSV of targets the agent may blind-transfer a call to, e.g. "201,202".
+    # Several entries are used in rotation, NOT as a capacity pool: the
+    # target is a queue, which holds callers rather than filling up, so a
+    # transfer is never refused on this side. TRANSFER_EXTENSION_COOLDOWN_
+    # SECONDS and TRANSFER_EXTENSION_BUSY_SECONDS are gone with the pool
+    # that read them -- see transfer_targets.py.
     transfer_extensions: str = field(default_factory=lambda: _env_str("TRANSFER_EXTENSIONS", ""))
     transfer_wait_seconds: float = field(default_factory=lambda: _env_float("TRANSFER_WAIT_SECONDS", 15.0))
-    transfer_extension_cooldown_seconds: float = field(
-        default_factory=lambda: _env_float("TRANSFER_EXTENSION_COOLDOWN_SECONDS", 2.0)
-    )
-    # How long a successfully-transferred extension is assumed busy before
-    # it's eligible again -- see extension_pool.py's caveat about no real
-    # presence signal from the PBX.
-    transfer_extension_busy_seconds: float = field(
-        default_factory=lambda: _env_float("TRANSFER_EXTENSION_BUSY_SECONDS", 300.0)
-    )
 
     # Phrase the agent speaks to trigger an internal transfer. Detection is
     # on the agent's own transcript (CallSession._maybe_trigger_transfer,
@@ -122,8 +118,10 @@ class Settings:
         default_factory=lambda: _env_float("EL_END_SESSION_TIMEOUT_SECONDS", 3.0)
     )
 
-    # --- "All lines busy" static prompt (played when the transfer trigger
-    # fires but no extension is free) ---
+    # --- "All lines busy" static prompt. Now reached ONLY when the trigger
+    # fires with TRANSFER_EXTENSIONS empty -- a misconfiguration, not a busy
+    # queue. It is kept for that case so a caller who was just told they are
+    # being transferred hears something rather than silence and a BYE. ---
     busy_prompt_enabled: bool = field(default_factory=lambda: _env_bool("BUSY_PROMPT_ENABLED", True))
     busy_prompt_audio_path: str = field(
         default_factory=lambda: _env_str("BUSY_PROMPT_AUDIO_PATH", "./assets/audio/all_lines_busy.wav")
