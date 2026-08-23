@@ -87,12 +87,43 @@ _RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429})
 # ("SIP rejection codes other than 486/503"). Nothing is guessed.
 CUSTOMER_NO_ANSWER_SIP_CODES = frozenset({486})
 
+# The endpoint's own response is the only thing that says whether a 200 was
+# actually accepted, so it is logged verbatim -- but bounded. A proxy error
+# page or an HTML login redirect can be tens of kilobytes, and service.log is
+# not the place for it.
+_MAX_LOGGED_BODY_CHARS = 1000
+
 # §4 defines trackingId as a GUID. main.py only checks the value is non-empty,
 # so this is advisory: a mismatch is logged and still sent, because the local
 # rule is a guess about their route binding and theirs is the one that counts.
 _GUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+
+
+def _response_fields(body: object) -> dict:
+    """A case-insensitive view of the response object.
+
+    AddCallResult_API_Guide §7 documents camelCase (`isSuccess`), but the
+    deployed endpoint answers in PascalCase:
+
+        {"IsSuccess":true,"Data":true,"ErrorMessage":null,
+         "ValidationErrors":[],"Message":null}
+
+    ASP.NET Core emits either, depending on whether JsonSerializerOptions
+    .PropertyNamingPolicy is left at its camelCase default or set to null, so
+    which one arrives is a deployment detail of theirs that can change under
+    us without notice. Reading only the documented spelling made five
+    DELIVERED pushes read as "not accepted", retry four extra times and then
+    dead-letter as permanently failed (observed 2026-08-23). Match on the
+    field name and ignore its casing.
+
+    A non-object body ("true", a list, a string) yields {} -- it carries no
+    fields, and the caller treats a missing isSuccess as not-a-success.
+    """
+    if not isinstance(body, dict):
+        return {}
+    return {str(k).lower(): v for k, v in body.items()}
 
 
 def is_customer_no_answer(sip_code: Optional[int]) -> bool:
@@ -171,6 +202,20 @@ class AddCallResultSender:
         if self._api_key and self._api_key in out:
             out = out.replace(self._api_key, "<redacted>")
         return out
+
+    def _body_for_log(self, resp) -> str:
+        """The raw response body, redacted and truncated, for the log line.
+
+        Reading .text can itself raise (a decoding failure on a malformed
+        charset), and a log call must never be the thing that fails a push."""
+        try:
+            text = resp.text or ""
+        except Exception as e:  # pragma: no cover - defensive
+            return f"<unreadable body: {type(e).__name__}: {self._safe(e)}>"
+        text = " ".join(text.split())  # collapse newlines: one log line, one record
+        if len(text) > _MAX_LOGGED_BODY_CHARS:
+            text = text[:_MAX_LOGGED_BODY_CHARS] + f"...<truncated, {len(text)} chars>"
+        return self._safe(text) if text else "<empty body>"
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -257,6 +302,17 @@ class AddCallResultSender:
 
         code = resp.status_code
 
+        # Log what came back on EVERY attempt, before any branching, so the
+        # 401 / 5xx / non-JSON / isSuccess:false paths are all covered by one
+        # line. Without it the only visible evidence of an isSuccess:false was
+        # its errorMessage, which is not enough to tell "no row yet" from a
+        # response shape the parsing below does not recognise.
+        logger.info(
+            f"AddCallResult response for TrackingId {tracking_id} "
+            f"(attempt {attempt}/{self._max_retries}): HTTP {code} "
+            f"body={self._body_for_log(resp)}"
+        )
+
         # 401 is not worth retrying: the key is wrong for every attempt, and
         # hammering an auth endpoint just fills the log with the same line.
         if code == 401:
@@ -298,18 +354,23 @@ class AddCallResultSender:
             self._schedule_retry(record, attempt)
             return
 
+        fields = _response_fields(body)
+
         # `is True` and not truthiness: a body carrying the string "false", or
         # 1, or a stray HTML page parsed as something odd, must not read as
         # success.
-        if isinstance(body, dict) and body.get("isSuccess") is True:
+        if fields.get("issuccess") is True:
             logger.info(
                 f"AddCallResult pushed for TrackingId {tracking_id} "
                 f"status={status} (attempt {attempt})"
             )
             return
 
+        # `Message` is the live shape's second text field; fall back to it so
+        # a failure that only populates that one is not logged as silent.
         error_message = self._safe(
-            (body.get("errorMessage") if isinstance(body, dict) else None)
+            fields.get("errormessage")
+            or fields.get("message")
             or "<no errorMessage in response>"
         )
 
@@ -317,7 +378,7 @@ class AddCallResultSender:
         # that is definitively permanent -- the request itself is malformed,
         # so every retry rebuilds the identical bad request while re-forcing
         # FinalOutcome on their side. Dead-letter it immediately instead.
-        validation_errors = body.get("validationErrors") if isinstance(body, dict) else None
+        validation_errors = fields.get("validationerrors")
         if validation_errors:
             logger.error(
                 f"AddCallResult push rejected as invalid for TrackingId "
