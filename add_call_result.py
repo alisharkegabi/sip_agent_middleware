@@ -15,6 +15,10 @@ gap. Only the no-answer family is pushed from here (Cancelled / Timeout);
 answered, transferred and transfer-failed calls are left entirely to the
 existing ElevenLabs path. See ADD_CALL_RESULT.md.
 
+There is no enable/disable flag. Setting ADD_CALL_RESULT_BASE_URL and
+ADD_CALL_RESULT_API_KEY is itself the decision to push, and every unanswered
+call is then reported. Blanking either one and restarting is the off-switch.
+
 Why `?status=` is always passed
 -------------------------------
 When FinalOutcome is still null the Tamweely payload falls back to the
@@ -48,7 +52,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -106,12 +110,9 @@ class AddCallResultSender:
     def __init__(self, settings: Settings):
         self._base_url = settings.add_call_result_base_url.rstrip("/")
         self._api_key = settings.add_call_result_api_key
-        # Three independent switches, all required. An operator who sets the
-        # flag but forgets the URL (or vice versa) gets a silent no-op plus
-        # the warning below rather than a stream of failed requests.
-        self._enabled = bool(
-            settings.add_call_result_enabled and self._base_url and self._api_key
-        )
+        # Configuring both of these IS the decision to push -- there is no
+        # separate on/off flag. Blanking either one is the off-switch.
+        self._enabled = bool(self._base_url and self._api_key)
         self._timeout = settings.add_call_result_timeout_seconds
         # TOTAL attempts, not retries-after-the-first: delivery gives up when
         # `attempt >= _max_retries`, so 5 means one initial try plus four
@@ -139,11 +140,20 @@ class AddCallResultSender:
         if self._dead_letter_path:
             os.makedirs(os.path.dirname(self._dead_letter_path) or ".", exist_ok=True)
 
-        if settings.add_call_result_enabled and not self._enabled:
+        # Say plainly, once, at startup which mode this process is in. With no
+        # flag to read back, this log line is how an operator confirms whether
+        # unanswered calls are reaching Tamweely -- and which host they reach.
+        # The hostname only: never the full URL, never the key.
+        if self._enabled:
+            logger.info(
+                f"AddCallResult push ACTIVE -> {urlparse(self._base_url).hostname} "
+                f"-- unanswered calls WILL be reported to Tamweely"
+            )
+        else:
             logger.warning(
-                "ADD_CALL_RESULT_ENABLED is set but ADD_CALL_RESULT_BASE_URL "
-                "and/or ADD_CALL_RESULT_API_KEY is empty -- results will NOT "
-                "be pushed to Tamweely"
+                "AddCallResult push INACTIVE: ADD_CALL_RESULT_BASE_URL and/or "
+                "ADD_CALL_RESULT_API_KEY is not set -- unanswered calls will "
+                "NOT be reported to Tamweely"
             )
 
     @property

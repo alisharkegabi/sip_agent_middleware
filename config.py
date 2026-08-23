@@ -233,12 +233,13 @@ class Settings:
     # Pushes the outcome of calls that were never answered to Tamweely's
     # AddCallResultByTrackingId endpoint. Those calls produce no ElevenLabs
     # conversation, so the post-call webhook that normally delivers a result
-    # never fires for them. Off by default: enabling it makes this service
-    # write to a customer-facing system, so it must be a deliberate act.
-    # A push is a no-op unless the flag is on AND both URL and key are set.
-    add_call_result_enabled: bool = field(
-        default_factory=lambda: _env_bool("ADD_CALL_RESULT_ENABLED", False)
-    )
+    # never fires for them.
+    #
+    # There is no on/off flag: configuring a base URL and an API key IS the
+    # decision to push, and the push then happens for every unanswered call.
+    # To stop it, blank one of the two below and restart -- that is the only
+    # off-switch, by deliberate choice, so nothing silently half-runs.
+    #
     # Origin only, e.g. https://host -- the documented route is appended in
     # add_call_result.py.
     add_call_result_base_url: str = field(
