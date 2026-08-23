@@ -229,6 +229,44 @@ class Settings:
         default_factory=lambda: _env_str("WEBHOOK_DEAD_LETTER_PATH", "./logs/webhook_dead_letter.jsonl")
     )
 
+    # --- Tamweely AddCallResult push (see ADD_CALL_RESULT.md) ---
+    # Pushes the outcome of calls that were never answered to Tamweely's
+    # AddCallResultByTrackingId endpoint. Those calls produce no ElevenLabs
+    # conversation, so the post-call webhook that normally delivers a result
+    # never fires for them. Off by default: enabling it makes this service
+    # write to a customer-facing system, so it must be a deliberate act.
+    # A push is a no-op unless the flag is on AND both URL and key are set.
+    add_call_result_enabled: bool = field(
+        default_factory=lambda: _env_bool("ADD_CALL_RESULT_ENABLED", False)
+    )
+    # Origin only, e.g. https://host -- the documented route is appended in
+    # add_call_result.py.
+    add_call_result_base_url: str = field(
+        default_factory=lambda: _env_str("ADD_CALL_RESULT_BASE_URL", "")
+    )
+    add_call_result_api_key: str = field(
+        default_factory=lambda: _env_str("ADD_CALL_RESULT_API_KEY", "")
+    )
+    add_call_result_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("ADD_CALL_RESULT_TIMEOUT_SECONDS", 10.0)
+    )
+    # Higher than the webhook's 3 on purpose: the .NET client can create the
+    # BatchCallDetails row up to ~3.4 s after POST /calls is accepted (see
+    # CALL_STATUS_TRACKING.md, "The RingAt race"), and a 486 Busy can resolve
+    # a call in ~1 s, so the first pushes may legitimately find no row. Five
+    # attempts with the backoff below span ~15 s, comfortably past that.
+    add_call_result_max_retries: int = field(
+        default_factory=lambda: _env_int("ADD_CALL_RESULT_MAX_RETRIES", 5)
+    )
+    add_call_result_max_retry_age_seconds: float = field(
+        default_factory=lambda: _env_float("ADD_CALL_RESULT_MAX_RETRY_AGE_SECONDS", 3600.0)
+    )
+    add_call_result_dead_letter_path: str = field(
+        default_factory=lambda: _env_str(
+            "ADD_CALL_RESULT_DEAD_LETTER_PATH", "./logs/add_call_result_dead_letter.jsonl"
+        )
+    )
+
     # --- API security (F-20, F-23) ---
     # Shared-secret header the .NET client must present. Empty disables the
     # check (NOT recommended in production -- set this before exposing the

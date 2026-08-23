@@ -45,6 +45,7 @@ from logging_config import get_logger, _DroppingQueueHandler
 from models import CallStatus
 from port_allocator import PortAllocator
 from static_audio import load_ulaw_frames
+import add_call_result
 from webhook_client import WebhookSender
 
 logger = get_logger("call_manager")
@@ -76,6 +77,13 @@ class CallManager:
         # the busy path just hangs up silently instead of playing audio.
         self._busy_frames = self._load_busy_frames(settings)
         self._webhook_sender = WebhookSender(settings)
+        # Built eagerly, on the startup thread. The sender is otherwise
+        # created lazily by the first push -- which happens on a SIP thread
+        # inside _record_call_ended, making that call pay for os.makedirs()
+        # on the dead-letter directory. It also means a misconfigured
+        # ADD_CALL_RESULT_* set warns at startup rather than at the first
+        # unanswered call.
+        add_call_result.get_sender()
         self._analysis_fetcher = AnalysisFetcher(settings)
         self._sessions: dict[str, CallSession] = {}
         self._lock = threading.RLock()
@@ -297,7 +305,10 @@ class CallManager:
         self._shutdown_event.set()
         for session in self.list_calls():
             if session.status in (CallStatus.PENDING, CallStatus.DIALING, CallStatus.RINGING, CallStatus.CONNECTED):
-                session.request_hangup()
+                # Tagged so _record_call_ended can tell a service drain from
+                # a client cancelling one call -- only the latter is pushed to
+                # Tamweely as "customer no answer".
+                session.request_hangup(reason="shutdown")
 
         deadline = time.time() + self.settings.shutdown_grace_seconds
         while time.time() < deadline:
@@ -331,4 +342,10 @@ class CallManager:
 
         self._analysis_fetcher.shutdown()
         self._webhook_sender.shutdown()
+        # Last, and after the drain above: a call worker that outlived
+        # shutdown_grace_seconds can still reach _record_call_ended and push.
+        # Once this returns, such a push is dead-lettered rather than sent --
+        # add_call_result.shutdown() deliberately keeps the shut-down sender
+        # in place so no fresh live one can be built behind it.
+        add_call_result.shutdown()
         logger.info("call manager shut down")

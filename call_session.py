@@ -39,6 +39,7 @@ from typing import Optional
 from elevenlabs.client import ElevenLabs
 from elevenlabs.conversational_ai.conversation import ClientTools, Conversation, ConversationInitiationData
 
+import add_call_result
 import db
 import sip_protocol as sip
 from audio_bridge import RtpAudioInterface
@@ -146,6 +147,7 @@ class CallSession:
 
         self._status_lock = threading.Lock()
         self._hangup_requested = threading.Event()  # per-call, replaces the global shutdown_requested
+        self._hangup_reason = "api"  # set by request_hangup(); see _record_call_ended
 
         self._sock: Optional[socket.socket] = None
         self._stream: Optional[sip.SipStream] = None
@@ -163,11 +165,41 @@ class CallSession:
         except Exception:
             self.logger.exception(f"failed to record call status in BatchCallDetails ({func.__name__})")
 
+    def _push_call_result(self, status: str) -> None:
+        """Best-effort push of a terminal outcome to Tamweely's AddCallResult
+        API -- same contract as _db_call: no-op without a tracking_id, and a
+        Tamweely outage can never affect the SIP call flow. The push itself is
+        asynchronous (add_call_result.push_async returns immediately), so this
+        does not block the SIP thread it is called from."""
+        if not self.tracking_id:
+            return
+        try:
+            add_call_result.push_async(self.tracking_id, status)
+        except Exception:
+            self.logger.exception(
+                f"failed to push call result to Tamweely (status={status})"
+            )
+
     # ------------------------------------------------------------------
     # Public control surface (called by CallManager / API layer)
     # ------------------------------------------------------------------
-    def request_hangup(self) -> None:
-        self._hangup_requested.set()
+    def request_hangup(self, reason: str = "api") -> None:
+        """reason distinguishes who asked. "api" is the .NET client calling
+        POST /calls/{id}/hangup -- a real cancellation of that call.
+        "shutdown" is CallManager draining every live session so the service
+        can stop, which is not a statement about this call at all and must
+        never be reported to Tamweely as "customer no answer".
+
+        FIRST writer wins, under the lock. Both can fire on one call: a
+        shutdown drain hangs up every live session, and an API hangup for the
+        same call can land in the same instant. Last-writer-wins let a
+        default-"api" call arriving after the drain flip the reason back and
+        push 202 for a deploy. Whoever asked first is the one that actually
+        ended the call, and that holds in both orderings."""
+        with self._status_lock:
+            if not self._hangup_requested.is_set():
+                self._hangup_reason = reason
+            self._hangup_requested.set()
 
     def request_transfer(self) -> dict:
         """HTTP fallback (POST /calls/{call_id}/transfer or
@@ -370,22 +402,64 @@ class CallSession:
              TranFail. That's intended: the transfer failure is a known
              fact, not a guess, and the callback obligation holds
              regardless of how the call finally ended.
+
+        A SUBSET of those statuses is additionally pushed to Tamweely's
+        AddCallResult API (see ADD_CALL_RESULT.md) -- the calls that never
+        produced an ElevenLabs conversation, and so would otherwise reach
+        Tamweely with no result at all. The push set is narrower than the DB
+        set on both edges:
+
+          * 503 writes Cancelled locally but is NOT pushed -- that is the PBX
+            failing, not the customer declining.
+          * a shutdown-initiated hangup writes Cancelled locally but is NOT
+            pushed -- that is our deploy, not the customer's behaviour.
+
+        Both exclusions exist for the same reason the failure reasons below
+        write nothing at all: a status we would have to guess at is worse
+        than no status, because a pushed Cancelled/Timeout permanently
+        overwrites FinalOutcome and SummaryArabic on Tamweely's side.
         """
         reject_status = db.sip_response_to_status(self._last_reject_code) if self._last_reject_code else None
+        # Set only for the no-answer family -- the calls that produce no
+        # ElevenLabs conversation, and therefore no post-call webhook, and
+        # therefore no result at Tamweely unless we push one. See
+        # ADD_CALL_RESULT.md.
+        push_status: Optional[str] = None
         if exit_reason == "transferred":
             self._db_call(db.mark_ended, status=db.STATUS_TRANSFERRED)
         elif exit_reason == "transfer_unavailable" or self._transfer_failed:
             self._db_call(db.mark_ended, status=db.STATUS_TRANSFER_FAILED)
         elif exit_reason == "ring_timeout":
             self._db_call(db.mark_ended, status=db.STATUS_TIMEOUT)
+            push_status = db.STATUS_TIMEOUT
         elif exit_reason == "local_hangup" and not self.answered:
             self._db_call(db.mark_ended, status=db.STATUS_CANCELLED)
+            # Only when a client actually cancelled this call. CallManager's
+            # shutdown drain hangs up every ringing session so the service can
+            # stop; reporting a deploy or a service restart to Tamweely as
+            # "customer no answer" would state something false about a
+            # customer who was still being rung. Status stays Cancelled
+            # locally either way -- that column is ours.
+            if self._hangup_reason != "shutdown":
+                push_status = db.STATUS_CANCELLED
         elif reject_status is not None:
             self._db_call(db.mark_ended, status=reject_status)
+            # Narrower than the DB mapping on purpose: db treats 486 and 503
+            # alike, but 503 is the PBX or a trunk failing, not the customer
+            # declining. See CUSTOMER_NO_ANSWER_SIP_CODES.
+            if add_call_result.is_customer_no_answer(self._last_reject_code):
+                push_status = reject_status
         elif exit_reason in (
             "remote_bye", "agent_ended", "local_hangup", "max_duration", "rtp_timeout",
         ):
             self._db_call(db.mark_ended)
+
+        # After the DB write, never before: mark_ended() owns EndedAt and is
+        # the record we keep even if Tamweely is unreachable. The push adds
+        # what only Tamweely's side can do -- FinalOutcome 202 and
+        # SummaryArabic -- and is asynchronous, so this returns at once.
+        if push_status is not None:
+            self._push_call_result(push_status)
 
     # ------------------------------------------------------------------
     # SIP handshake + bridge (equivalent to the reference script's main())
