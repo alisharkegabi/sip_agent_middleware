@@ -4,8 +4,9 @@ Pushes the outcome of **calls that were never answered** to Tamweely's
 `AddCallResultByTrackingId` endpoint, keyed by the same `TrackingId` that
 [`db.py`](db.py) already uses for `dbo.BatchCallDetails`.
 
-**Off by default.** Nothing changes until `ADD_CALL_RESULT_ENABLED=true` and both
-the base URL and API key are set in `.env`.
+**Configuring it turns it on.** There is no separate enable flag: set
+`ADD_CALL_RESULT_BASE_URL` and `ADD_CALL_RESULT_API_KEY` in `.env` and every
+unanswered call is reported from then on. Leave either blank and nothing is sent.
 
 ## Why it exists
 
@@ -178,10 +179,13 @@ push entirely; the `BatchCallDetails` row still holds the outcome.
 ## `.env` settings (add these yourself; not committed)
 
 ```bash
-ADD_CALL_RESULT_ENABLED=true
-ADD_CALL_RESULT_BASE_URL=https://<host>
+ADD_CALL_RESULT_BASE_URL=https://<the Tamweely host>
 ADD_CALL_RESULT_API_KEY=<the shared API key>
 ```
+
+Both are required. Setting them **is** the decision to push — there is no separate
+on/off flag, by deliberate choice, so there is no state where the service is half
+configured and silently doing nothing.
 
 `ADD_CALL_RESULT_BASE_URL` is an **origin only** — the documented route
 `/v1/data/add-call-result/by-tracking-id/{trackingId}` is appended in code.
@@ -199,15 +203,47 @@ ADD_CALL_RESULT_DEAD_LETTER_PATH=./logs/add_call_result_dead_letter.jsonl
 first: `5` means one initial try plus four retries, spanning roughly 15 s of
 backoff — comfortably past the ~3.4 s row-creation race.
 
-Setting `ADD_CALL_RESULT_ENABLED=true` while either the URL or the key is empty
-logs a warning at startup and pushes nothing.
+### Confirming which mode a running service is in
+
+With no flag to read back, the startup log is the source of truth. Exactly one of
+these appears once, when the service starts:
+
+```
+AddCallResult push ACTIVE -> <hostname> -- unanswered calls WILL be reported to Tamweely
+AddCallResult push INACTIVE: ADD_CALL_RESULT_BASE_URL and/or ADD_CALL_RESULT_API_KEY
+is not set -- unanswered calls will NOT be reported to Tamweely
+```
+
+Check that line after any deployment. The hostname is logged so a wrong environment
+is visible immediately; the API key never is.
+
+**If NEITHER line appears**, the service did not load `.env` at all. Under NSSM that
+usually means `AppDirectory` is not the folder containing `.env`:
+
+```bash
+nssm set OutboundCallingService AppDirectory "C:\path\to\service"
+```
+
+`config.py` calls `load_dotenv()` with no explicit path, so python-dotenv searches
+upward from the working directory. Same class of failure as a stale `LOCAL_IP`.
+
+**`.env` beats the process environment.** That call passes `override=True`, so a value
+in `.env` wins over one exported by NSSM, the shell, or a container. Setting
+`ADD_CALL_RESULT_BASE_URL` as a service environment variable will *not* take effect if
+`.env` also defines it — edit `.env`, not the service config. This applies to every
+setting in `config.py`, not just these.
+
+### Turning it off
+
+Blank `ADD_CALL_RESULT_BASE_URL` (or the key) and restart. That is the only
+off-switch — there is no flag to flip and no way to disable it without a restart.
 
 ## Files
 
 | File | Change |
 |---|---|
 | [add_call_result.py](add_call_result.py) | New. `AddCallResultSender` plus module-level `push_async()` / `shutdown()`, and `CUSTOMER_NO_ANSWER_SIP_CODES` |
-| [config.py](config.py) | Seven `ADD_CALL_RESULT_*` settings |
+| [config.py](config.py) | Six `ADD_CALL_RESULT_*` settings (no enable flag) |
 | [call_session.py](call_session.py) | `_push_call_result()` beside `_db_call()`; three branches of `_record_call_ended()` set a push status; `request_hangup(reason=...)` records who asked |
 | [call_manager.py](call_manager.py) | Tags the shutdown drain `reason="shutdown"`; calls `add_call_result.shutdown()` last |
 | [tests/test_add_call_result.py](tests/test_add_call_result.py) | New, 59 tests |

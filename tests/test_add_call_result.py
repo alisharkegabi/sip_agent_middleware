@@ -36,7 +36,6 @@ class _FakeSettings:
     """Only the fields AddCallResultSender reads."""
 
     def __init__(self, **overrides):
-        self.add_call_result_enabled = True
         self.add_call_result_base_url = "https://tamweely.example"
         self.add_call_result_api_key = "test-key-do-not-log"
         self.add_call_result_timeout_seconds = 10.0
@@ -321,11 +320,12 @@ class TestRetryBudget:
 # --------------------------------------------------------------------------
 class TestDisabled:
     @pytest.mark.parametrize("overrides", [
-        {"enabled": False},
         {"base_url": ""},
         {"api_key": ""},
     ])
-    def test_disabled_makes_no_request(self, monkeypatch, overrides):
+    def test_missing_config_makes_no_request(self, monkeypatch, overrides):
+        """There is no on/off flag -- blanking the URL or the key IS the
+        off-switch, so each alone must fully disable the push."""
         s = AddCallResultSender(_FakeSettings(**overrides))
         calls = _patch_post(monkeypatch, _FakeResponse(200, {"isSuccess": True}))
         s.push_async(GUID, "Timeout")
