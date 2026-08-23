@@ -52,6 +52,17 @@ class _FakeResponse:
         self._body = body
         self._raw = raw
 
+    @property
+    def text(self):
+        """requests.Response.text always exists -- the sender logs it on
+        every attempt, so a fake without it would exercise nothing but the
+        defensive except in _body_for_log()."""
+        if self._raw is not None:
+            return self._raw
+        if self._body is None:
+            return ""
+        return json.dumps(self._body)
+
     def json(self):
         if self._raw is not None:
             raise ValueError("not JSON")
@@ -161,6 +172,128 @@ class TestRequestConstruction:
 # --------------------------------------------------------------------------
 # Response handling -- one test per row of the table in ADD_CALL_RESULT.md
 # --------------------------------------------------------------------------
+class TestResponseLogging:
+    """The endpoint returns HTTP 200 for both success and failure, so the body
+    is the only evidence of which one happened. It is logged on every attempt,
+    whatever the outcome."""
+
+    def test_body_is_logged_on_success(self, sender, monkeypatch, caplog):
+        _patch_post(monkeypatch, _FakeResponse(200, {"isSuccess": True, "data": True}))
+        with caplog.at_level("INFO"):
+            sender._attempt(_record(), 1)
+        assert '"isSuccess": true' in caplog.text
+        assert "HTTP 200" in caplog.text
+
+    def test_body_is_logged_when_not_accepted(self, sender, monkeypatch, caplog):
+        _patch_post(
+            monkeypatch,
+            _FakeResponse(200, {"isSuccess": False, "errorMessage": "No BatchCallDetail found"}),
+        )
+        _capture_retries(monkeypatch, sender)
+        with caplog.at_level("INFO"):
+            sender._attempt(_record(), 1)
+        assert "No BatchCallDetail found" in caplog.text
+
+    def test_non_json_body_is_logged(self, sender, monkeypatch, caplog):
+        """The case the old code was blindest to: a proxy's HTML error page
+        retried five times with nothing in the log saying what it was."""
+        _patch_post(monkeypatch, _FakeResponse(200, raw="<html>login required</html>"))
+        _capture_retries(monkeypatch, sender)
+        with caplog.at_level("INFO"):
+            sender._attempt(_record(), 1)
+        assert "login required" in caplog.text
+
+    def test_oversized_body_is_truncated(self, sender, monkeypatch, caplog):
+        _patch_post(monkeypatch, _FakeResponse(200, raw="x" * 50_000))
+        _capture_retries(monkeypatch, sender)
+        with caplog.at_level("INFO"):
+            sender._attempt(_record(), 1)
+        assert "truncated, 50000 chars" in caplog.text
+        assert len(caplog.text) < 5_000
+
+    def test_body_is_logged_on_error_status(self, sender, monkeypatch, caplog):
+        _patch_post(monkeypatch, _FakeResponse(500, raw="upstream exploded"))
+        _capture_retries(monkeypatch, sender)
+        with caplog.at_level("INFO"):
+            sender._attempt(_record(), 1)
+        assert "HTTP 500" in caplog.text
+        assert "upstream exploded" in caplog.text
+
+
+class TestResponseFieldCasing:
+    """The guide documents camelCase; the deployed endpoint answers in
+    PascalCase. Both must read the same, because which one arrives is a
+    deployment detail on their side."""
+
+    # Copied verbatim from service.log, 2026-08-23 18:30:35.
+    LIVE_SUCCESS_BODY = {
+        "IsSuccess": True,
+        "Data": True,
+        "ErrorMessage": None,
+        "ValidationErrors": [],
+        "Message": None,
+    }
+
+    def test_pascal_case_success_does_not_retry(self, sender, monkeypatch):
+        """The regression: this exact body was retried 5x and dead-lettered
+        as permanently failed, after Tamweely had already accepted it."""
+        _patch_post(monkeypatch, _FakeResponse(200, self.LIVE_SUCCESS_BODY))
+        scheduled = _capture_retries(monkeypatch, sender)
+        sender._attempt(_record(), 1)
+        assert scheduled == []
+        assert _dead_letters(sender) == []
+
+    def test_pascal_case_failure_still_retries(self, sender, monkeypatch):
+        _patch_post(
+            monkeypatch,
+            _FakeResponse(200, {"IsSuccess": False, "ErrorMessage": "No BatchCallDetail found"}),
+        )
+        scheduled = _capture_retries(monkeypatch, sender)
+        sender._attempt(_record(), 1)
+        assert len(scheduled) == 1
+
+    def test_pascal_case_validation_errors_are_permanent(self, sender, monkeypatch):
+        _patch_post(
+            monkeypatch,
+            _FakeResponse(
+                200,
+                {
+                    "IsSuccess": False,
+                    "ErrorMessage": "Validation failed",
+                    "ValidationErrors": ["trackingId must be a GUID"],
+                },
+            ),
+        )
+        scheduled = _capture_retries(monkeypatch, sender)
+        sender._attempt(_record(), 1)
+        assert scheduled == []
+        assert _dead_letters(sender)[0]["_reason"] == "validation_error"
+
+    def test_message_field_is_used_when_error_message_is_absent(
+        self, sender, monkeypatch, caplog
+    ):
+        _patch_post(monkeypatch, _FakeResponse(200, {"IsSuccess": False, "Message": "row locked"}))
+        _capture_retries(monkeypatch, sender)
+        with caplog.at_level("INFO"):
+            sender._attempt(_record(), 1)
+        assert "row locked" in caplog.text
+
+    def test_truthy_non_true_is_still_not_success(self, sender, monkeypatch):
+        """Case-insensitivity must not weaken the `is True` check."""
+        for value in ("true", 1, "True", [1]):
+            _patch_post(monkeypatch, _FakeResponse(200, {"IsSuccess": value}))
+            scheduled = _capture_retries(monkeypatch, sender)
+            sender._attempt(_record(), 1)
+            assert len(scheduled) == 1, f"{value!r} must not read as success"
+
+    def test_non_object_body_is_not_success(self, sender, monkeypatch):
+        for body in (True, [{"IsSuccess": True}], "IsSuccess"):
+            _patch_post(monkeypatch, _FakeResponse(200, body))
+            scheduled = _capture_retries(monkeypatch, sender)
+            sender._attempt(_record(), 1)
+            assert len(scheduled) == 1, f"{body!r} must not read as success"
+
+
 class TestResponseHandling:
     def test_success_does_not_retry(self, sender, monkeypatch):
         _patch_post(monkeypatch, _FakeResponse(200, {"isSuccess": True, "data": True}))

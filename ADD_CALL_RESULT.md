@@ -73,6 +73,21 @@ force 202 (§4.1). The enum binds by name, and those names match `db.py`'s
 Tamweely-side failure come back 200 — the `isSuccess` field in the body is what
 decides, and it is checked with `is True`, not truthiness.
 
+**Field names are matched case-insensitively.** The guide writes them in camelCase,
+but the deployed endpoint answers in PascalCase:
+
+```json
+{"IsSuccess":true,"Data":true,"ErrorMessage":null,"ValidationErrors":[],"Message":null}
+```
+
+ASP.NET Core emits either spelling depending on whether `PropertyNamingPolicy` is
+left at its camelCase default, so which one arrives is a deployment detail on their
+side that can change without notice. Reading only the documented casing made five
+*delivered* pushes read as "not accepted", retry four extra times and dead-letter as
+permanently failed (observed 2026-08-23; regression test
+`TestResponseFieldCasing::test_pascal_case_success_does_not_retry`). The table below
+therefore applies to `isSuccess`/`IsSuccess` alike.
+
 | Response | Action |
 |---|---|
 | `200` + `isSuccess: true` | Done |
