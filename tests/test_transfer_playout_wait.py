@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from call_session import CallSession  # noqa: E402
 from config import Settings  # noqa: E402
-from extension_pool import ExtensionPool  # noqa: E402
+from transfer_targets import TransferTargets  # noqa: E402
 from port_allocator import PortAllocator  # noqa: E402
 
 
@@ -48,7 +48,7 @@ def _make_session() -> CallSession:
         dynamic_variables={},
         settings=Settings(),
         port_allocator=PortAllocator(10000, 10999, 1.0),
-        extension_pool=ExtensionPool(["406"], cooldown_seconds=1.0),
+        transfer_targets=TransferTargets(["406"]),
         tracking_id=None,
     )
 

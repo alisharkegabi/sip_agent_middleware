@@ -40,7 +40,7 @@ from typing import Optional
 from call_session import CallSession
 from config import Settings
 from conversation_analysis import AnalysisFetcher
-from extension_pool import ExtensionPool
+from transfer_targets import TransferTargets
 from logging_config import get_logger, _DroppingQueueHandler
 from models import CallStatus
 from port_allocator import PortAllocator
@@ -68,9 +68,13 @@ class CallManager:
             settings.rtp_port_min, settings.rtp_port_max, settings.rtp_port_cooldown_seconds
         )
         transfer_extensions = [e.strip() for e in settings.transfer_extensions.split(",") if e.strip()]
-        self._extension_pool = ExtensionPool(
-            transfer_extensions, cooldown_seconds=settings.transfer_extension_cooldown_seconds
-        )
+        self._transfer_targets = TransferTargets(transfer_extensions)
+        if not self._transfer_targets:
+            # Not fatal -- calls still run, they just cannot be handed off.
+            # Logged loudly because the only symptom on a live call is the
+            # busy prompt, which reads as a PBX problem rather than a
+            # missing setting.
+            logger.error("TRANSFER_EXTENSIONS is empty: call transfer is unavailable")
         # Loaded once per process (not once per call -- 30 concurrent calls
         # must not each re-decode/re-filter the same WAV). A missing or
         # corrupt file is a startup-time log error, not a live-call crash:
@@ -144,7 +148,7 @@ class CallManager:
             speech_dynamic_variables=speech_dynamic_variables,
             settings=self.settings,
             port_allocator=self._port_allocator,
-            extension_pool=self._extension_pool,
+            transfer_targets=self._transfer_targets,
             tracking_id=tracking_id,
             busy_frames=self._busy_frames,
         )
@@ -254,7 +258,11 @@ class CallManager:
                     oldest_queued = max(0.0, time.time() - min(s.queued_at for s in queued_sessions))
 
         port_stats = self._port_allocator.stats()
-        extension_stats = self._extension_pool.stats()
+        # "free"/"in_use" are gone with the pool -- a queue is never in
+        # use and never runs out, so reporting either would be reporting a
+        # fiction. What an operator can still act on is whether any target
+        # is configured at all.
+        target_stats = self._transfer_targets.stats()
         return {
             "status": "ok" if not self._shutdown_event.is_set() else "shutting_down",
             "active_calls": active,
@@ -265,8 +273,7 @@ class CallManager:
             "total_failed": total_failed,
             "rtp_ports_free": port_stats["free"],
             "rtp_ports_in_use": port_stats["in_use"],
-            "transfer_extensions_free": extension_stats["free"],
-            "transfer_extensions_in_use": extension_stats["in_use"],
+            "transfer_targets_configured": target_stats["configured"],
             "uptime_seconds": time.time() - self._started_at,
             "queue_depth": queued,
             "oldest_queued_seconds": oldest_queued,

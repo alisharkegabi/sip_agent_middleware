@@ -14,8 +14,7 @@ the only part with no test at all. The three bugs pinned here were all
      picks up -- i.e. the normal case.
   3. ANY in-dialog BYE during the REFER wait was reported as a successful
      transfer. A caller hanging up while on hold therefore wrote
-     Status=Transfer for a call no human ever took, and quarantined the
-     extension for TRANSFER_EXTENSION_BUSY_SECONDS.
+     Status=Transfer for a call no human ever took.
 
 The peer here is a real TCP socket on loopback driven by the test, not a
 mock, because the thing under test is SipStream framing + message dispatch
@@ -37,7 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import sip_protocol as sip  # noqa: E402
 from call_session import CallSession, _TransferRequest  # noqa: E402
 from config import Settings  # noqa: E402
-from extension_pool import ExtensionPool, ExtensionPoolExhausted  # noqa: E402
+from transfer_targets import TransferTargets  # noqa: E402
 from port_allocator import PortAllocator  # noqa: E402
 
 EXTENSION = "406"
@@ -78,7 +77,7 @@ def session(peer, tmp_path):
         dynamic_variables={},
         settings=settings,
         port_allocator=PortAllocator(10000, 10999, 1.0),
-        extension_pool=ExtensionPool([EXTENSION], cooldown_seconds=0.0),
+        transfer_targets=TransferTargets([EXTENSION]),
         tracking_id=None,  # keeps _db_call a no-op: no SQL Server in tests
     )
     s._sock = session_side
@@ -102,11 +101,10 @@ def _run_transfer(session: CallSession) -> dict:
     """Run _perform_transfer on its own thread (it is the SIP thread in
     production) and hand back a dict of what it returned.
 
-    The extension is taken from the pool exactly as the bridge loop takes
-    it, not hand-written into the request: ExtensionPool.release() is a
-    silent no-op for an extension that was never acquired, so a hand-built
-    request makes every release/quarantine assertion vacuously pass."""
-    extension = session._extension_pool.acquire()
+    The target is chosen exactly as the bridge loop chooses it, not
+    hand-written into the request, so these tests exercise the same seam
+    production does."""
+    extension = session._transfer_targets.next_target()
     assert extension == EXTENSION
     request = _TransferRequest(extension=extension, source="agent_phrase")
     out: dict = {}
@@ -304,25 +302,14 @@ class TestByeDuringTransfer:
         assert session.transferred_to is None, "a hangup must not be recorded as a transfer"
         assert session._transfer_failed is True
 
-    def test_caller_hangup_does_not_quarantine_the_extension(self, session, peer):
-        """The old behaviour marked the extension busy for
-        TRANSFER_EXTENSION_BUSY_SECONDS (300s by default) over a transfer
-        that never happened -- under load that starves the pool."""
-        _, pbx = peer
-        run = _run_transfer(session)
-
-        cseq = _refer_cseq(_read_refer(pbx))
-        pbx.sendall(_response(202, "Accepted", cseq))
-        pbx.sendall(_bye())
-        run["thread"].join(timeout=10)
-
-        # cooldown_seconds=0.0 on this pool, so a plain release() makes the
-        # extension immediately reusable; a busy_seconds release would not.
-        assert session._extension_pool.acquire() == EXTENSION
-
-    def test_completed_transfer_does_quarantine_the_extension(self, session, peer):
-        """The mirror of the test above -- a human really is on that
-        extension now, so it must NOT come straight back to the pool."""
+    def test_completed_transfer_leaves_the_target_immediately_reusable(self, session, peer):
+        """THE BUG THIS EXISTS FOR: the old ExtensionPool quarantined a
+        target for TRANSFER_EXTENSION_BUSY_SECONDS (300s) after a
+        successful handoff, so the next caller transferred within five
+        minutes was refused by this service and heard "all lines are busy,
+        we will contact you within two days" -- while the PBX queue sat
+        idle. The target is a queue: it holds callers, it does not fill up,
+        and a completed transfer must not take it out of service."""
         _, pbx = peer
         run = _run_transfer(session)
 
@@ -333,8 +320,20 @@ class TestByeDuringTransfer:
         run["thread"].join(timeout=10)
         assert run["outcome"] == "transferred"
 
-        with pytest.raises(ExtensionPoolExhausted):
-            session._extension_pool.acquire()
+        assert session._transfer_targets.next_target() == EXTENSION
+
+    def test_caller_hangup_leaves_the_target_immediately_reusable(self, session, peer):
+        """Same guarantee on the failure side -- nothing about one call's
+        outcome may withhold the queue from the next call."""
+        _, pbx = peer
+        run = _run_transfer(session)
+
+        cseq = _refer_cseq(_read_refer(pbx))
+        pbx.sendall(_response(202, "Accepted", cseq))
+        pbx.sendall(_bye())
+        run["thread"].join(timeout=10)
+
+        assert session._transfer_targets.next_target() == EXTENSION
 
     def test_bye_is_answered_with_200_ok(self, session, peer):
         """Whichever way the BYE is interpreted, it must be acknowledged --

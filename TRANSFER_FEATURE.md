@@ -1,9 +1,10 @@
 # Call Transfer Feature (SIP REFER to an internal extension)
 
-Hands a live call off to a human on an internal PBX extension mid-
-conversation, using a blind SIP REFER on the existing dialog. If no
-extension is currently free, the caller hears a pre-rendered static audio
-message instead, and the call ends cleanly.
+Hands a live call off to a human mid-conversation, using a blind SIP REFER
+on the existing dialog. The target is a **PBX queue / hotline number**, so
+the REFER always goes out and the PBX decides what the caller gets — ring,
+queue, hold music. This service never refuses a transfer on its own
+judgement; see § "Why there is no busy path".
 
 **The trigger is the agent's own speech, not an ElevenLabs tool call or
 webhook.** The middleware watches the agent's transcript for one exact
@@ -139,9 +140,17 @@ See `CALL_STATUS_TRACKING.md` for the full status scheme and the exact
 `_record_call_ended()` ordering.
 
 ### `call_manager.py`
-- Builds one shared `ExtensionPool` from `settings.transfer_extensions` at
-  startup (unchanged) and now also eagerly loads the busy-prompt frames via
-  `static_audio.load_ulaw_frames`, passing them into every `CallSession`.
+- Builds one shared `TransferTargets` from `settings.transfer_extensions` at
+  startup, logging an error if it is empty (transfers are then impossible),
+  and eagerly loads the busy-prompt frames via `static_audio.load_ulaw_frames`,
+  passing both into every `CallSession`.
+- `health()` reports `transfer_targets_configured`. It replaced
+  `transfer_extensions_free` / `transfer_extensions_in_use`, which described
+  a pool that no longer exists — a queue is never "in use" and never runs
+  out, so both numbers were fiction. **This is a breaking change to the
+  `/health` payload** (`models.HealthResponse`); the fields are dropped
+  rather than pinned at `0`, because a client reading "0 free extensions"
+  would conclude transfers are down while they work normally.
 
 ### `call_session.py` (core of the feature)
 - **`_maybe_trigger_transfer(text)`** — called from `on_agent_response` for
@@ -158,10 +167,11 @@ See `CALL_STATUS_TRACKING.md` for the full status scheme and the exact
   created fresh per call, is what makes it structurally impossible for one
   call's trigger phrase to move another call's leg — **see the anti-mixup
   test in the manual verification checklist below.**
-- **Extension acquisition moved to the SIP thread.** Every entry point now
-  enqueues a `_TransferRequest(extension=None, ...)`; the bridge loop is the
-  only place that calls `ExtensionPool.acquire()`. This means "all lines
-  busy" behaves identically no matter what triggered the transfer.
+- **Target selection happens on the SIP thread.** Every entry point enqueues
+  a `_TransferRequest(extension=None, ...)`; the bridge loop is the only
+  place that calls `TransferTargets.next_target()`, so a transfer behaves
+  identically no matter what triggered it. Selection cannot fail unless
+  nothing is configured.
 - **`_wait_for_playout(quiet_seconds, timeout, wait_for_start)`** — blocks
   the SIP thread (not the RTP send/recv threads, which keep running) until
   the RTP play queue has been empty for `quiet_seconds` with no new TTS
@@ -192,8 +202,8 @@ See `CALL_STATUS_TRACKING.md` for the full status scheme and the exact
   confirmed** — a rejected REFER leaves the call live, and the agent must
   still be able to speak.
 - **`_play_busy_prompt_and_close()`** — runs on the SIP thread when the
-  transfer trigger fires but no extension is free (pool exhausted, or not
-  configured). Plays the busy prompt to completion via
+  transfer trigger fires and `TRANSFER_EXTENSIONS` is empty, which is now
+  its **only** caller (see § "Why there is no busy path"). Plays the busy prompt to completion via
   `play_static_frames` + `_wait_for_playout` + a `BUSY_PROMPT_TAIL_SECONDS`
   hold, **then** closes the ElevenLabs session; the caller sets
   `exit_reason = "transfer_unavailable"` and ends the call with a normal
@@ -267,7 +277,7 @@ drives a real TCP peer on loopback.
   sending a final NOTIFY, so that reading has to keep working — but applying
   it unconditionally meant a **caller hanging up while on hold** was recorded
   as a successful transfer: `Status = Transfer` for a call no human ever
-  took, plus the extension quarantined for `TRANSFER_EXTENSION_BUSY_SECONDS`.
+  took.
   With no progress signal, a BYE is now read as the hangup it almost
   certainly is: outcome `"remote_bye"`, `_mark_transfer_failed()`, and the
   extension released without a busy hold.
@@ -277,7 +287,47 @@ break **without** sending a BYE of its own (`_perform_transfer` already
 answered the caller's BYE with 200 OK) — and must break rather than
 `continue`, or the loop would spin on a dead dialog until `MAX_CALL_SECONDS`.
 
+## Why there is no busy path
+
+The transfer target is a **PBX queue**, and a queue holds callers rather than
+filling up. The original design did not model it that way: `ExtensionPool`
+treated targets as scarce resources, quarantined one for
+`TRANSFER_EXTENSION_BUSY_SECONDS` (300 s) after every successful handoff, and
+refused the transfer outright once none were free. It also had no PBX presence
+or BLF visibility whatsoever — it only tracked what this middleware had itself
+handed out — so "all lines are busy" was a guess made from no evidence.
+
+**The failure that produced:** with a handful of hotline numbers configured, a
+second transfer to the same queue inside five minutes was refused *by this
+service*. The caller, who had just been told `هيتم تحويل المكالمة دلوقتي`, heard
+"all lines are busy, we'll contact you within two days" and the call was
+recorded `TranFail` — while the queue on the other end sat idle, ready to take
+them.
+
+So `ExtensionPool` is gone, replaced by [`transfer_targets.py`](transfer_targets.py):
+a round-robin cursor over `TRANSFER_EXTENSIONS` that never blocks, never
+raises, and has no notion of a target being in use. Rotation exists only to
+spread calls across several configured numbers — **it is not a capacity
+mechanism and nothing downstream may treat it as one.** Whether the queue can
+take the call is the PBX's answer to give, and it gives it in the REFER
+response.
+
+`TRANSFER_EXTENSION_COOLDOWN_SECONDS` and `TRANSFER_EXTENSION_BUSY_SECONDS`
+were removed from `config.py` with the pool that read them. Any lines left in
+`.env` are inert.
+
+A REFER that is rejected or times out is unchanged: the call stays live, the
+one-shot guard resets so the agent can announce again, and `_transfer_failed`
+still yields `Status = TranFail` if the call ends untransferred. **No busy
+prompt plays there** — a rejected REFER means something is broken, not that
+the queue is full.
+
 ## "All lines busy" prompt
+
+Now reached only when `TRANSFER_EXTENSIONS` is empty — a misconfiguration, not
+a busy queue — and kept for exactly that case so a caller who was just told
+they are being transferred hears something rather than silence and a BYE. On a
+correctly configured host it never plays.
 
 Text (Arabic, verbatim — do not reword):
 
@@ -296,10 +346,12 @@ this way is **not** indistinguishable from a normal completed call in
 
 ```bash
 # --- Call transfer (SIP REFER to an internal extension) ---
+# Queue / hotline numbers. Several entries are used in ROTATION, not as a
+# capacity pool -- a transfer is never refused on this side.
 TRANSFER_EXTENSIONS=201,202,203
 TRANSFER_WAIT_SECONDS=15
-TRANSFER_EXTENSION_COOLDOWN_SECONDS=2
-TRANSFER_EXTENSION_BUSY_SECONDS=300
+# TRANSFER_EXTENSION_COOLDOWN_SECONDS and TRANSFER_EXTENSION_BUSY_SECONDS
+# were removed with ExtensionPool. Any such lines still in .env are inert.
 
 # Phrase the agent speaks to trigger an internal transfer. Detection is on
 # the agent's own transcript -- ElevenLabs no longer POSTs to this service
@@ -369,8 +421,10 @@ most:
 
 ## Not yet done / possible follow-ups
 
-- No real PBX presence/BLF for extension availability — the pool still
-  guesses via `TRANSFER_EXTENSION_BUSY_SECONDS`.
+- No real PBX presence/BLF for target availability. This no longer matters
+  for a queue, which is why the guessing was removed rather than improved.
+  It would matter again if `TRANSFER_EXTENSIONS` were ever pointed at
+  individual desk phones — don't, without revisiting this.
 - Only blind transfer is implemented (no attended/consultation leg where
   the middleware waits for the human to accept before dropping the
   caller).
