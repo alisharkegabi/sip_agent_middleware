@@ -224,6 +224,172 @@ class InboundResampler:
         return np.clip(y, -32768, 32767).astype("<i2").tobytes()
 
 
+class InboundRtpStats:
+    """Loss, reordering and jitter accounting for the caller -> agent leg.
+
+    The receive loop has always parsed the RTP header and discarded the
+    sequence number, so inbound packet loss has never been measurable
+    here. It needs to be, because the symptoms currently attributed to
+    noisy caller environments -- fragmented transcripts, the agent saying
+    the line is unclear, choppy audio -- are equally consistent with
+    packets that never arrived. No amount of noise suppression recovers a
+    dropped packet, and the fix for one is nothing like the fix for the
+    other, so this distinguishes them before any DSP is designed.
+
+    Accounting is RFC 3550: extended sequence numbers with cycle counting,
+    expected-minus-received for loss, and the smoothed 1/16 interarrival
+    jitter estimator.
+
+    Two honest limits on the output:
+
+    - `gap_buckets` and `max_gap` record FORWARD jumps as they are seen, so
+      a packet that merely arrived late inflates them. `lost` does not have
+      this problem (expected-minus-received self-corrects when the straggler
+      lands), so read `reordered` before trusting the burst profile.
+    - A mid-call SSRC change -- a re-INVITE or a transfer, both of which
+      this system does -- restarts the sequence space. That resets the
+      accounting rather than reporting 60000 lost packets, and is counted
+      in `ssrc_changes`.
+
+    Counters only: nothing here sees audio, and nothing it emits can carry
+    customer data into a log line.
+
+    NOT THREAD-SAFE; only ever called from the RTP receive thread.
+    """
+
+    _CLOCK_HZ = 8000  # PCMU RTP timestamp rate
+    _RECENT = 512     # duplicate/reorder detection window, in packets
+
+    def __init__(self, clock_hz: int = _CLOCK_HZ):
+        self._clock_hz = clock_hz
+        self._ssrc: Optional[int] = None
+        self.ssrc_changes = 0
+        self._reset()
+
+    def _reset(self) -> None:
+        self._base_ext: Optional[int] = None
+        self._max_ext = 0
+        self._cycles = 0
+        self._last_seq = 0
+        self.received = 0
+        self.duplicates = 0
+        self.reordered = 0
+        self.max_gap = 0
+        self._gaps = {"1": 0, "2": 0, "3-5": 0, "6-10": 0, ">10": 0}
+        self._recent: deque = deque(maxlen=self._RECENT)
+        self._recent_set: set = set()
+        self._prev_transit: Optional[float] = None
+        self._prev_arrival: Optional[float] = None
+        self._jitter = 0.0
+        self.max_interarrival_s = 0.0
+
+    def _bucket(self, gap: int) -> None:
+        if gap <= 0:
+            return
+        if gap == 1:
+            self._gaps["1"] += 1
+        elif gap == 2:
+            self._gaps["2"] += 1
+        elif gap <= 5:
+            self._gaps["3-5"] += 1
+        elif gap <= 10:
+            self._gaps["6-10"] += 1
+        else:
+            self._gaps[">10"] += 1
+
+    def observe(self, *, seq: int, rtp_timestamp: int, arrival_monotonic: float) -> None:
+        """Record one received RTP packet. Call before the payload-type
+        filter -- DTMF and comfort-noise packets share the sequence space,
+        and skipping them would read as loss."""
+        # --- extended sequence number ---
+        if self._base_ext is None:
+            self._cycles = 0
+            ext = seq
+            self._base_ext = ext
+            self._max_ext = ext
+        else:
+            # A drop of more than half the sequence space is a wrap, not a
+            # 32000-packet jump backwards.
+            if seq < self._last_seq - 32768:
+                self._cycles += 1
+            elif seq > self._last_seq + 32768:
+                self._cycles -= 1  # a straggler from before the wrap
+            ext = (self._cycles << 16) | seq
+        self._last_seq = seq
+
+        # --- duplicate / reorder ---
+        if ext in self._recent_set:
+            self.duplicates += 1
+            return
+        if len(self._recent) == self._recent.maxlen and self._recent:
+            self._recent_set.discard(self._recent[0])
+        self._recent.append(ext)
+        self._recent_set.add(ext)
+
+        self.received += 1
+
+        if ext > self._max_ext:
+            gap = ext - self._max_ext - 1
+            if gap > 0:
+                self.max_gap = max(self.max_gap, gap)
+                self._bucket(gap)
+            self._max_ext = ext
+        elif ext < self._max_ext:
+            self.reordered += 1
+
+        # --- RFC 3550 interarrival jitter ---
+        transit = arrival_monotonic * self._clock_hz - rtp_timestamp
+        if self._prev_transit is not None:
+            d = abs(transit - self._prev_transit)
+            self._jitter += (d - self._jitter) / 16.0
+        self._prev_transit = transit
+
+        if self._prev_arrival is not None:
+            self.max_interarrival_s = max(
+                self.max_interarrival_s, arrival_monotonic - self._prev_arrival
+            )
+        self._prev_arrival = arrival_monotonic
+
+    def note_ssrc(self, ssrc: int) -> None:
+        """A new SSRC restarts the sequence space; keep the change visible
+        rather than letting it read as catastrophic loss."""
+        if self._ssrc is None:
+            self._ssrc = ssrc
+        elif ssrc != self._ssrc:
+            self._ssrc = ssrc
+            self.ssrc_changes += 1
+            self._reset()
+
+    def summary(self) -> dict:
+        expected = 0 if self._base_ext is None else self._max_ext - self._base_ext + 1
+        lost = max(0, expected - self.received)
+        return {
+            "received": self.received,
+            "expected": expected,
+            "lost": lost,
+            "loss_pct": round(100.0 * lost / expected, 3) if expected else 0.0,
+            "duplicates": self.duplicates,
+            "reordered": self.reordered,
+            "max_gap": self.max_gap,
+            "gap_buckets": dict(self._gaps),
+            "jitter_ms": round(self._jitter / self._clock_hz * 1000.0, 3),
+            "max_interarrival_ms": round(self.max_interarrival_s * 1000.0, 1),
+            "ssrc_changes": self.ssrc_changes,
+        }
+
+    def format_line(self) -> str:
+        s = self.summary()
+        return (
+            f"rtp_in received={s['received']} expected={s['expected']} "
+            f"lost={s['lost']} loss_pct={s['loss_pct']} "
+            f"dup={s['duplicates']} reordered={s['reordered']} "
+            f"max_gap={s['max_gap']} bursts={s['gap_buckets']} "
+            f"jitter_ms={s['jitter_ms']} "
+            f"max_interarrival_ms={s['max_interarrival_ms']} "
+            f"ssrc_changes={s['ssrc_changes']}"
+        )
+
+
 class RtpAudioInterface(AudioInterface):
     def __init__(
         self,
@@ -315,6 +481,10 @@ class RtpAudioInterface(AudioInterface):
         self.seq_num = 0
         self.timestamp = 0
         self.ssrc = int.from_bytes(os.urandom(4), "big")  # unique per call, was a fixed constant
+        # Inbound (caller -> us) loss/jitter accounting. Transmit-side
+        # seq_num/timestamp above are ours; these count what arrives.
+        self._rtp_stats = InboundRtpStats()
+        self._stats_logged = False  # stop() is reached twice; log once
         self._ulaw_silence_byte = audioop.lin2ulaw(b"\x00\x00", 2)
 
         self._play_queue = deque()
@@ -372,10 +542,31 @@ class RtpAudioInterface(AudioInterface):
         threading.Thread(target=self._rtp_recv_loop, daemon=True, name=f"rtp-recv-{self.call_id}").start()
         threading.Thread(target=self._rtp_send_loop, daemon=True, name=f"rtp-send-{self.call_id}").start()
 
+    def rtp_stats(self) -> dict:
+        """Inbound loss/jitter counters for this call. Log-safe."""
+        return self._rtp_stats.summary()
+
     def stop(self):
         self.is_running = False
         with self._play_cv:
             self._play_cv.notify_all()
+        # One line per call, at teardown. This is the whole point of the
+        # instrumentation: it says whether the caller's audio was damaged
+        # in transit before anyone reasons about the acoustics.
+        #
+        # Guarded because stop() is reached twice on the normal path -- the
+        # ElevenLabs SDK closes the audio interface from end_session(), and
+        # CallSession._cleanup() then calls it again (correctly: it must be
+        # idempotent for the paths where the SDK never started). Everything
+        # else in here already tolerates the second call; an unguarded log
+        # emitted the summary twice per call, which would double-count in
+        # any later aggregation over the service log.
+        if self._logger and not self._stats_logged:
+            self._stats_logged = True
+            try:
+                self._logger.info(self._rtp_stats.format_line())
+            except Exception:
+                pass
         try:
             self.udp_sock.close()
         except Exception:
@@ -634,6 +825,19 @@ class RtpAudioInterface(AudioInterface):
 
                 if version != 2:
                     continue
+
+                # Inbound loss/jitter accounting. Deliberately BEFORE the
+                # payload-type filter below: DTMF and comfort-noise packets
+                # occupy the same sequence space, so skipping them here
+                # would read as packet loss. Counters only, no audio, and
+                # it reuses the monotonic clock already read above.
+                seq, rtp_ts, ssrc = struct.unpack("!HII", data[2:12])
+                self._rtp_stats.note_ssrc(ssrc)
+                self._rtp_stats.observe(
+                    seq=seq,
+                    rtp_timestamp=rtp_ts,
+                    arrival_monotonic=self.last_rx_monotonic,
+                )
 
                 offset = 12 + (cc * 4)
                 if extension:
