@@ -31,15 +31,25 @@ it is only sent where the statement is true.
 | Ring timeout (`MAX_RING_SECONDS`) | `Timeout` | ✅ `Timeout` | Customer did not pick up |
 | SIP `486` Busy | `Cancelled` | ✅ `Cancelled` | Customer's phone rejected the call |
 | Client hangup before answer (`POST /calls/{id}/hangup`) | `Cancelled` | ✅ `Cancelled` | The .NET client cancelled this call deliberately |
-| SIP `503` Service Unavailable | `Cancelled` | ❌ | **PBX or trunk failure.** The customer's phone was never reached, let alone unanswered |
+| SIP `503` Service Unavailable | `Cancelled` | ✅ `Cancelled` | **PBX or trunk failure**, not the customer declining. Pushed since 2026-08-31 anyway — see the note below |
 | Hangup from service **shutdown** | `Cancelled` | ❌ | A deploy or service restart, not customer behaviour |
 | Answered call (BYE, max duration, RTP timeout) | `Answered` | ❌ | Produced a conversation — the ElevenLabs webhook already delivers it |
 | `Transfer` / `TranFail` | as before | ❌ | Answered calls; same as above |
 | `connect_timeout`, `connect_failed`, `internal_error`, auth failure, port exhaustion | *(nothing written)* | ❌ | Never reached the customer |
 
-The two `❌` rows that still write `Cancelled` locally are the important ones: the
-`Status` column is ours to record freely, but a push is a claim made to a
-customer-facing system.
+The `❌` row that still writes `Cancelled` locally — the shutdown hangup — is the
+important one: the `Status` column is ours to record freely, but a push is a claim
+made to a customer-facing system.
+
+**On `503` (changed 2026-08-31).** A `503` is the PBX or an upstream trunk
+failing, so on a dead trunk the customer's phone was never reached, let alone
+unanswered, and it was excluded for exactly that reason. It is pushed now by
+explicit request: Tamweely exposes no distinct outcome code for a PBX-side
+failure, so the only options were 202 «العميل عدم رد» or no result at all, and a
+missing result was judged the worse of the two. The cost is accepted knowingly —
+a trunk outage now overwrites `FinalOutcome` and `SummaryArabic` with "the
+customer did not answer". If Tamweely ever adds a PBX-failure code, this is the
+row to revisit.
 
 ### Still open with Tamweely
 

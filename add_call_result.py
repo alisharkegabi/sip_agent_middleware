@@ -74,18 +74,25 @@ _RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429})
 # SIP final responses that mean *the customer* did not take the call, and so
 # may honestly be reported to Tamweely as 202 "العميل عدم رد".
 #
-# Deliberately NARROWER than db._CANCELLED_SIP_CODES, which is {486, 503}.
-# 503 Service Unavailable is the PBX or an upstream trunk failing -- the
-# customer's phone was never reached, let alone unanswered. Recording it
-# locally as Cancelled is fine (that column is ours), but pushing it as 202
-# would tell Tamweely something false and permanently overwrite FinalOutcome
-# and SummaryArabic on their side. Same reasoning that keeps connect_timeout
-# and connect_failed out of the push entirely.
+# Identical to db._CANCELLED_SIP_CODES: every rejection that maps to Cancelled
+# in our own column is also pushed.
+#
+# 503 Service Unavailable was excluded until 2026-08-31, on the grounds that it
+# is the PBX or an upstream trunk failing rather than the customer declining --
+# on a dead trunk the phone was never reached, let alone unanswered. It is
+# included now by explicit request. Tamweely exposes no distinct outcome code
+# for a PBX-side failure, so the only choice was 202 or no result at all, and a
+# missing result was judged the worse of the two.
+#
+# The cost is real and deliberate: the push permanently overwrites FinalOutcome
+# and SummaryArabic, so a trunk outage is now recorded as the customer not
+# answering. connect_timeout and connect_failed stay out of the push entirely
+# -- those never reached the PBX, so there is no dialog to report on at all.
 #
 # 480/408/600/603/604 are NOT here: whether those count as customer no-answer
 # is a Tamweely business question, still open in CALL_STATUS_TRACKING.md
 # ("SIP rejection codes other than 486/503"). Nothing is guessed.
-CUSTOMER_NO_ANSWER_SIP_CODES = frozenset({486})
+CUSTOMER_NO_ANSWER_SIP_CODES = frozenset({486, 503})
 
 # The endpoint's own response is the only thing that says whether a 200 was
 # actually accepted, so it is logged verbatim -- but bounded. A proxy error

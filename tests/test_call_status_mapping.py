@@ -174,6 +174,16 @@ class TestPushedToTamweely:
         fake = _record("agent_ended", last_reject_code=486)
         assert fake.pushes == [db.STATUS_CANCELLED]
 
+    def test_503_pushes_cancelled(self):
+        """503 is the PBX or a trunk failing, not the customer declining, and
+        it was excluded for exactly that reason until 2026-08-31. Tamweely
+        exposes no distinct outcome code for a PBX-side failure, so the
+        choice was 202 or no result at all; 202 was chosen deliberately."""
+        fake = _record("agent_ended", last_reject_code=503)
+        _, _, kwargs = fake.calls[0]
+        assert kwargs["status"] == db.STATUS_CANCELLED
+        assert fake.pushes == [db.STATUS_CANCELLED]
+
     def test_db_write_happens_before_the_push(self):
         """mark_ended owns EndedAt and is the record we keep even when
         Tamweely is unreachable, so it must not depend on the push."""
@@ -182,15 +192,6 @@ class TestPushedToTamweely:
 
 
 class TestNotPushedToTamweely:
-    def test_503_writes_cancelled_but_does_not_push(self):
-        """503 is the PBX or a trunk failing. Recording Cancelled in our own
-        column is fine; telling Tamweely the customer did not answer a call
-        their phone never received is not."""
-        fake = _record("agent_ended", last_reject_code=503)
-        _, _, kwargs = fake.calls[0]
-        assert kwargs["status"] == db.STATUS_CANCELLED
-        assert fake.pushes == []
-
     def test_shutdown_hangup_writes_cancelled_but_does_not_push(self):
         """CallManager.shutdown() hangs up every ringing session so the
         service can stop. That is a deploy, not customer behaviour."""

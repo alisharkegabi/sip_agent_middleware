@@ -406,15 +406,14 @@ class CallSession:
         A SUBSET of those statuses is additionally pushed to Tamweely's
         AddCallResult API (see ADD_CALL_RESULT.md) -- the calls that never
         produced an ElevenLabs conversation, and so would otherwise reach
-        Tamweely with no result at all. The push set is narrower than the DB
-        set on both edges:
+        Tamweely with no result at all. The push set now agrees with the DB
+        set on rejection codes -- 486 and 503 both push -- and stays narrower
+        on one edge:
 
-          * 503 writes Cancelled locally but is NOT pushed -- that is the PBX
-            failing, not the customer declining.
           * a shutdown-initiated hangup writes Cancelled locally but is NOT
             pushed -- that is our deploy, not the customer's behaviour.
 
-        Both exclusions exist for the same reason the failure reasons below
+        That exclusion exists for the same reason the failure reasons below
         write nothing at all: a status we would have to guess at is worse
         than no status, because a pushed Cancelled/Timeout permanently
         overwrites FinalOutcome and SummaryArabic on Tamweely's side.
@@ -444,9 +443,10 @@ class CallSession:
                 push_status = db.STATUS_CANCELLED
         elif reject_status is not None:
             self._db_call(db.mark_ended, status=reject_status)
-            # Narrower than the DB mapping on purpose: db treats 486 and 503
-            # alike, but 503 is the PBX or a trunk failing, not the customer
-            # declining. See CUSTOMER_NO_ANSWER_SIP_CODES.
+            # Agrees with the DB mapping: db treats 486 and 503 alike and so
+            # does the push. 503 is the PBX or a trunk failing rather than
+            # the customer declining, but Tamweely has no distinct code for
+            # that, so it goes as 202 too. See CUSTOMER_NO_ANSWER_SIP_CODES.
             if add_call_result.is_customer_no_answer(self._last_reject_code):
                 push_status = reject_status
         elif exit_reason in (

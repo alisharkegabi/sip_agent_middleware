@@ -676,13 +676,14 @@ class TestCustomerNoAnswerCodes:
     def test_486_busy_is_customer_side(self):
         assert add_call_result.is_customer_no_answer(486) is True
 
-    def test_503_is_not_customer_side(self):
-        """db maps 503 to Cancelled for our own column, but 503 is the PBX or
-        a trunk failing -- pushing it as 202 would tell Tamweely the customer
-        did not answer a call their phone never received."""
+    def test_503_is_pushed(self):
+        """503 is the PBX or a trunk failing rather than the customer
+        declining, but Tamweely exposes no distinct outcome code for that, so
+        it is pushed as 202 like 486. The push set and db._CANCELLED_SIP_CODES
+        agree on rejection codes."""
         import db
         assert 503 in db._CANCELLED_SIP_CODES
-        assert add_call_result.is_customer_no_answer(503) is False
+        assert add_call_result.is_customer_no_answer(503) is True
 
     @pytest.mark.parametrize("code", [None, 408, 480, 600, 603, 604, 200])
     def test_unresolved_codes_are_excluded(self, code):
