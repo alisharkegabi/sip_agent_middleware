@@ -515,3 +515,146 @@ def test_omitting_the_speech_snapshot_falls_back_to_raw():
     raw = {"user_name": "على"}
     s = _session(raw)
     assert s.speech_dynamic_variables is raw
+
+
+# --------------------------------------------------------------------------
+# Stage 2 -- pronunciation. CHOSEN BY EAR 2026-08-31 against the production
+# voice HqYWHPHcPZzpeN2p6AJM on eleven_multilingual_v2, not by theory. The
+# probe rig is Claude_files/tts_probe/. `خلاف` is spelled correctly and is
+# still read as the word خِلاف ("dispute"); `خَلَف` is what makes the voice say
+# the surname. These are deliberate misspellings and only ElevenLabs sees them.
+# --------------------------------------------------------------------------
+KHALLAF_ALIAS = "خَلَف"                      # خَلَف
+NAYYERA_ALIAS = "نَيِّرَة"  # نَيِّرَة
+ESMAT_ALIAS = "عِصْمَت"           # عِصْمَت
+GIRGIS_ALIAS = "جِرْجِس"          # جِرْجِس
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("خلاف", KHALLAF_ALIAS),
+    ("محمد خلاف", "محمد " + KHALLAF_ALIAS),
+    ("نيرة", NAYYERA_ALIAS),
+    ("عصمت", ESMAT_ALIAS),
+    ("محمد عصمت", "محمد " + ESMAT_ALIAS),
+    ("جرجس", GIRGIS_ALIAS),
+])
+def test_pronunciation_alias_is_applied(value, expected):
+    out, _ = nn.normalize_name(value)
+    assert out == expected
+
+
+def test_spelling_repair_chains_into_the_pronunciation_alias():
+    """`نيره` is repaired to `نيرة` by stage 1, which is what stage 2 is keyed
+    on. Without the chain the ة/ه variant would silently keep the old reading,
+    and only one of the two spellings would ever be said correctly."""
+    out, counters = nn.normalize_name("نيره")
+    assert out == NAYYERA_ALIAS
+    assert counters == {nn.RULE_OVERRIDE: 1, nn.RULE_PRONUNCIATION: 1}
+
+
+def test_alias_survives_edge_punctuation():
+    out, _ = nn.normalize_name("خلاف،")
+    assert out == KHALLAF_ALIAS + "،"
+
+
+def test_aliases_are_the_exact_code_points_that_were_listened_to(data):
+    """MEASURED: ElevenLabs does not NFC-normalize its input -- two strings
+    that are Unicode-canonically equal produced different audio. So a
+    visually-identical retyping of an alias is NOT the same alias, and this
+    test pins the byte sequence that was actually approved rather than how it
+    renders."""
+    assert data["pronunciation"]["خلاف"] == KHALLAF_ALIAS
+    assert data["pronunciation"]["نيرة"] == NAYYERA_ALIAS
+    assert data["pronunciation"]["عصمت"] == ESMAT_ALIAS
+    assert data["pronunciation"]["جرجس"] == GIRGIS_ALIAS
+
+
+def test_only_configured_keys_get_an_alias():
+    """A contract ref that happens to contain the name must not be respelled."""
+    raw = {"user_name": "خلاف", "contract_ref": "خلاف-123"}
+    out, _ = nn.normalize_dynamic_variables(raw, ["user_name"])
+    assert out["user_name"] == KHALLAF_ALIAS
+    assert out["contract_ref"] == "خلاف-123"
+
+
+def test_pronunciation_keys_carry_no_harakat_or_tatweel(data):
+    """Lookups canonicalize, so a key with marks on it can never match."""
+    marks = set("ًٌٍَُِّْـٰ")
+    bad = [k for k in data.get("pronunciation", {}) if marks & set(k)]
+    assert bad == []
+
+
+def test_no_pronunciation_key_is_also_an_override_key(data):
+    """Stage 1 would rewrite the token first and the entry would be dead."""
+    both = set(data.get("pronunciation", {})) & set(data["overrides"])
+    assert both == set()
+
+
+def test_no_pronunciation_maps_a_token_to_itself(data):
+    assert [k for k, v in data.get("pronunciation", {}).items() if k == v] == []
+
+
+# --------------------------------------------------------------------------
+# Gender-conditional pronunciation. `ملك` is Malak for a woman and Malik for a
+# man on the SAME spelling, so a flat alias would rename every Malik. The
+# borrower payload's own gender column decides, exactly as it does for the
+# stage-1 يسرى/يسري case. CHOSEN BY EAR 2026-08-31.
+# --------------------------------------------------------------------------
+MALAK_ALIAS = "مَلَك"  # مَلَك
+
+
+@pytest.mark.parametrize("gender,expected", [
+    ("female", MALAK_ALIAS),
+    ("Female", MALAK_ALIAS),
+    ("أنثى", MALAK_ALIAS),
+    ("male", "ملك"),
+    ("Male", "ملك"),
+    ("", "ملك"),
+    (None, "ملك"),
+    ("wat", "ملك"),
+])
+def test_female_conditional_alias_follows_the_gender_column(gender, expected):
+    """Only a positive FEMALE reading applies it. Blank, absent or unrecognised
+    gender must leave the name alone -- that is the safe direction, because
+    saying Malak to a man called Malik is worse than the status quo."""
+    out, _ = nn.normalize_name("ملك", nn.parse_gender(gender))
+    assert out == expected
+
+
+def test_female_conditional_alias_is_given_name_position_only():
+    """In `سارة ملك` the second token is the father's name and he is a man, so
+    the alias must not fire there even though the record is female."""
+    out, _ = nn.normalize_name("سارة ملك", nn.FEMALE)
+    assert out == "سارة ملك"
+    out, _ = nn.normalize_name("ملك محمد", nn.FEMALE)
+    assert out == MALAK_ALIAS + " محمد"
+
+
+def test_female_conditional_alias_end_to_end_reads_the_payload_gender():
+    raw = {"user_name": "ملك", "br_gender": "Female", "call_receiver": "ملك",
+           "cr_gender": "Male"}
+    out, counters = nn.normalize_dynamic_variables(
+        raw, ["user_name", "call_receiver"],
+        {"user_name": "br_gender", "call_receiver": "cr_gender"})
+    assert out["user_name"] == MALAK_ALIAS      # she is Malak
+    assert out["call_receiver"] == "ملك"        # he is Malik -- untouched
+    assert counters == {nn.RULE_PRONUNCIATION_FEMALE: 1}
+
+
+def test_malak_alias_is_the_exact_code_points_that_were_listened_to(data):
+    assert data["pronunciation_if_female"]["ملك"] == MALAK_ALIAS
+
+
+def test_no_token_is_in_both_pronunciation_tables(data):
+    """The unconditional table is consulted first, so the conditional entry
+    would be unreachable and the gender logic silently dead."""
+    both = set(data.get("pronunciation", {})) & set(data.get("pronunciation_if_female", {}))
+    assert both == set()
+
+
+def test_female_conditional_keys_are_clean(data):
+    marks = set("ًٌٍَُِّْـٰ")
+    table = data.get("pronunciation_if_female", {})
+    assert [k for k in table if marks & set(k)] == []
+    assert set(table) & set(data["overrides"]) == set()
+    assert [k for k, v in table.items() if k == v] == []

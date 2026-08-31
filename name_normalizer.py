@@ -21,6 +21,14 @@ Design, in short:
 Data lives in arabic_names.json and is loaded and validated once at import --
 never mid-call. See Claude_files/NAME_NORMALIZATION_DESIGN.md.
 
+A second stage, `pronunciation`, runs after the spelling is settled. Correct
+orthography is not always correct speech: `خلاف` (Khallaf) is spelled exactly
+right and the voice still reads it as the word خِلاف, so TTS is handed `خَلَف`
+instead. Stage-2 output is a deliberate misspelling and only ElevenLabs ever
+sees it -- `dynamic_variables` keeps what the client sent. Every alias is
+chosen by listening to the production voice, never by theory; the probe rig is
+in Claude_files/tts_probe/.
+
 This module never logs a name. Names are borrower data; only rule names and
 counts leave here.
 """
@@ -59,6 +67,8 @@ _AL = "ال"  # ال
 RULE_OVERRIDE = "override"
 RULE_DOTLESS_YA = "dotless_ya"
 RULE_GENDER_PROTECTED = "gender_protected"
+RULE_PRONUNCIATION = "pronunciation"
+RULE_PRONUNCIATION_FEMALE = "pronunciation_female"
 RULE_ERROR = "error"
 
 FEMALE = "female"
@@ -90,15 +100,20 @@ class NameDataError(Exception):
     """arabic_names.json is missing, malformed, or internally inconsistent."""
 
 
-def _validate(data: Any) -> tuple[dict[str, str], frozenset[str], frozenset[str]]:
+def _validate(
+    data: Any,
+) -> tuple[dict[str, str], frozenset[str], frozenset[str], dict[str, str]]:
     if not isinstance(data, dict):
         raise NameDataError("top level is not an object")
 
     overrides = data.get("overrides")
     protected = data.get("protected_final_ya")
     if_female = data.get("protected_if_female", [])
+    pronunciation = data.get("pronunciation", {})
+    pron_if_female = data.get("pronunciation_if_female", {})
     if not isinstance(overrides, dict):
         raise NameDataError("`overrides` missing or not an object")
+
     if not isinstance(protected, list):
         raise NameDataError("`protected_final_ya` missing or not a list")
     if not isinstance(if_female, list):
@@ -135,29 +150,73 @@ def _validate(data: Any) -> tuple[dict[str, str], frozenset[str], frozenset[str]
         # dead data and the male reading silently stays broken.
         raise NameDataError(f"token is both unconditionally and conditionally protected: {sorted(overlap)}")
 
-    return dict(overrides), frozenset(protected_set), frozenset(if_female_set)
+    def _pron_table(table: Any, label: str) -> dict[str, str]:
+        if not isinstance(table, dict):
+            raise NameDataError(f"`{label}` must be an object")
+        for k, v in table.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                raise NameDataError(f"`{label}` must map string to string")
+            if k == v:
+                raise NameDataError(f"{label} maps a token to itself: {k!r}")
+            # Lookups canonicalize, so a key carrying harakat or tatweel could
+            # never be matched by anything. Always a typo.
+            if set(k) & _STRIP_FOR_MATCH:
+                raise NameDataError(f"{label} key carries harakat/tatweel: {k!r}")
+            # Stage 1 would rewrite the token before stage 2 saw this key,
+            # leaving the entry dead. Key it on the corrected spelling instead.
+            if k in overrides:
+                raise NameDataError(f"{label} key is also an override key: {k!r}")
+        return dict(table)
+
+    pron = _pron_table(pronunciation, "pronunciation")
+    pron_f = _pron_table(pron_if_female, "pronunciation_if_female")
+    # The unconditional table is consulted first, so a token in both would make
+    # the gender-conditional entry unreachable.
+    both = set(pron) & set(pron_f)
+    if both:
+        raise NameDataError(f"token is in both pronunciation tables: {sorted(both)}")
+
+    return (
+        dict(overrides),
+        frozenset(protected_set),
+        frozenset(if_female_set),
+        pron,
+        pron_f,
+    )
 
 
-def _load() -> tuple[dict[str, str], frozenset[str], frozenset[str], Optional[str]]:
+def _load() -> tuple[
+    dict[str, str], frozenset[str], frozenset[str], dict[str, str], dict[str, str],
+    Optional[str]
+]:
     """Fail open. A broken data file disables normalization and is logged
     loudly; it must never stop the service from placing calls. This is a
     pronunciation enhancement, not a safety control."""
     try:
         raw = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-        overrides, protected, if_female = _validate(raw)
+        overrides, protected, if_female, pronunciation, pron_female = _validate(raw)
         logger.info(
             f"name normalization data loaded: {len(protected)} protected, "
-            f"{len(if_female)} gender-conditional, {len(overrides)} overrides"
+            f"{len(if_female)} gender-conditional, {len(overrides)} overrides, "
+            f"{len(pronunciation)} pronunciation, "
+            f"{len(pron_female)} female-conditional pronunciation"
         )
-        return overrides, protected, if_female, None
+        return overrides, protected, if_female, pronunciation, pron_female, None
     except Exception as e:
         logger.error(
             f"name normalization DISABLED -- could not load {DATA_FILE.name}: {e}"
         )
-        return {}, frozenset(), frozenset(), str(e)
+        return {}, frozenset(), frozenset(), {}, {}, str(e)
 
 
-OVERRIDES, PROTECTED, PROTECTED_IF_FEMALE, LOAD_ERROR = _load()
+(
+    OVERRIDES,
+    PROTECTED,
+    PROTECTED_IF_FEMALE,
+    PRONUNCIATION,
+    PRONUNCIATION_IF_FEMALE,
+    LOAD_ERROR,
+) = _load()
 
 
 def _canonical(core: str) -> str:
@@ -174,9 +233,13 @@ def _canonical(core: str) -> str:
 
 def _normalize_token(
     token: str, *, gender: Optional[str] = None, is_given_name: bool = False
-) -> tuple[str, Optional[str]]:
-    """Returns (token, rule_fired). Punctuation on either edge is set aside and
-    restored so that `على،` resolves the same as `على`.
+) -> tuple[str, tuple[str, ...]]:
+    """Returns (token, rules_fired). Punctuation on either edge is set aside
+    and restored so that `على،` resolves the same as `على`.
+
+    Two stages in order: `_spell` settles the orthography, then `_pronounce`
+    respells the result for the voice. Both can fire on one token, which is why
+    the return is a tuple and not a single rule.
 
     `is_given_name` marks the first token of the value. In an Arabic full name
     that is the person's own name and takes their gender; the tokens after it
@@ -186,36 +249,82 @@ def _normalize_token(
     head_len = len(token) - len(token.lstrip(_EDGE_PUNCT))
     tail_start = len(token.rstrip(_EDGE_PUNCT))
     if head_len >= tail_start:  # punctuation only
-        return token, None
+        return token, ()
     head = token[:head_len]
     stripped = token[head_len:tail_start]
     tail = token[tail_start:]
 
+    fixed, rule = _spell(stripped, gender=gender, is_given_name=is_given_name)
+    spoken, prule = _pronounce(fixed, gender=gender, is_given_name=is_given_name)
+    rules = tuple(r for r in (rule, prule) if r)
+    return head + spoken + tail, rules
+
+
+def _spell(
+    stripped: str, *, gender: Optional[str], is_given_name: bool
+) -> tuple[str, Optional[str]]:
+    """Stage 1 -- orthography. What the name should have been stored as."""
     key = _canonical(stripped)
 
     # Order matters: an explicit override is the most specific statement of
     # intent, so it wins outright and the rule never runs on its result.
     if key in OVERRIDES:
-        return head + OVERRIDES[key] + tail, RULE_OVERRIDE
+        return OVERRIDES[key], RULE_OVERRIDE
     if key.startswith(_AL) and key[2:] in OVERRIDES:
-        return head + _AL + OVERRIDES[key[2:]] + tail, RULE_OVERRIDE
+        return _AL + OVERRIDES[key[2:]], RULE_OVERRIDE
 
     # Protection covers the bare name and its ال- form, so `نور الهدى` needs no
     # multi-token entry: `الهدى` resolves through `هدى`.
     if key in PROTECTED or (key.startswith(_AL) and key[2:] in PROTECTED):
-        return token, None
+        return stripped, None
 
     # Gender-conditional: `يسرى` is Yosra for a woman and a degraded Yosri for
     # a man. Only the given-name position consults gender, and only a positive
     # MALE reading unlocks the rule -- absent or unrecognised gender protects,
     # which is the behaviour from before gender was wired in.
     if _in_conditional(key) and is_given_name and gender != MALE:
-        return token, RULE_GENDER_PROTECTED
+        return stripped, RULE_GENDER_PROTECTED
 
     if stripped.endswith(ALEF_MAKSURA):
-        return head + stripped[:-1] + YA + tail, RULE_DOTLESS_YA
+        return stripped[:-1] + YA, RULE_DOTLESS_YA
 
-    return token, None
+    return stripped, None
+
+
+def _pronounce(
+    text: str, *, gender: Optional[str] = None, is_given_name: bool = False
+) -> tuple[str, Optional[str]]:
+    """Stage 2 -- how the voice says it, not how the name is spelled.
+
+    Runs on stage 1's output, so `نيره` and `نيرة` reach the same alias
+    through one entry rather than needing one each.
+
+    The female-conditional table is for skeletons that are two DIFFERENT names
+    depending on the bearer: `ملك` is Malak for a woman and Malik for a man,
+    so a flat alias would rename half of them. Same rule as the stage-1 gender
+    logic -- only the given-name position consults gender, because the tokens
+    after it are the father's and grandfather's names -- and only a positive
+    FEMALE reading applies the alias. Absent or unrecognised gender leaves the
+    name alone, which is the safe direction.
+    """
+    key = _canonical(text)
+    hit = _lookup(key, PRONUNCIATION)
+    if hit is not None:
+        return hit, RULE_PRONUNCIATION
+    if is_given_name and gender == FEMALE:
+        hit = _lookup(key, PRONUNCIATION_IF_FEMALE)
+        if hit is not None:
+            return hit, RULE_PRONUNCIATION_FEMALE
+    return text, None
+
+
+def _lookup(key: str, table: dict[str, str]) -> Optional[str]:
+    """The bare name or its ال- form."""
+    if key in table:
+        return table[key]
+    if key.startswith(_AL) and key[2:] in table:
+        return _AL + table[key[2:]]
+    return None
 
 
 def _in_conditional(key: str) -> bool:
@@ -245,12 +354,12 @@ def normalize_name(value: Any, gender: Optional[str] = None) -> tuple[Any, dict[
         if part.isspace() or not part:
             out.append(part)
             continue
-        new_part, rule = _normalize_token(
+        new_part, rules = _normalize_token(
             part, gender=gender, is_given_name=not seen_word
         )
         seen_word = True
         out.append(new_part)
-        if rule:
+        for rule in rules:
             counters[rule] = counters.get(rule, 0) + 1
     return "".join(out), counters
 
