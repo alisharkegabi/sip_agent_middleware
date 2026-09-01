@@ -111,6 +111,7 @@ def _validate(
     if_female = data.get("protected_if_female", [])
     pronunciation = data.get("pronunciation", {})
     pron_if_female = data.get("pronunciation_if_female", {})
+    pron_full = data.get("pronunciation_in_full_name", {})
     if not isinstance(overrides, dict):
         raise NameDataError("`overrides` missing or not an object")
 
@@ -170,6 +171,9 @@ def _validate(
 
     pron = _pron_table(pronunciation, "pronunciation")
     pron_f = _pron_table(pron_if_female, "pronunciation_if_female")
+    # Deliberately MAY share keys with `pronunciation` -- that is the point: the
+    # same name takes a different respelling once another name sits beside it.
+    pron_full_t = _pron_table(pron_full, "pronunciation_in_full_name")
     # The unconditional table is consulted first, so a token in both would make
     # the gender-conditional entry unreachable.
     both = set(pron) & set(pron_f)
@@ -182,31 +186,35 @@ def _validate(
         frozenset(if_female_set),
         pron,
         pron_f,
+        pron_full_t,
     )
 
 
 def _load() -> tuple[
     dict[str, str], frozenset[str], frozenset[str], dict[str, str], dict[str, str],
-    Optional[str]
+    dict[str, str], Optional[str]
 ]:
     """Fail open. A broken data file disables normalization and is logged
     loudly; it must never stop the service from placing calls. This is a
     pronunciation enhancement, not a safety control."""
     try:
         raw = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-        overrides, protected, if_female, pronunciation, pron_female = _validate(raw)
+        (overrides, protected, if_female, pronunciation, pron_female,
+         pron_full) = _validate(raw)
         logger.info(
             f"name normalization data loaded: {len(protected)} protected, "
             f"{len(if_female)} gender-conditional, {len(overrides)} overrides, "
             f"{len(pronunciation)} pronunciation, "
-            f"{len(pron_female)} female-conditional pronunciation"
+            f"{len(pron_female)} female-conditional pronunciation, "
+            f"{len(pron_full)} full-name pronunciation"
         )
-        return overrides, protected, if_female, pronunciation, pron_female, None
+        return (overrides, protected, if_female, pronunciation, pron_female,
+                pron_full, None)
     except Exception as e:
         logger.error(
             f"name normalization DISABLED -- could not load {DATA_FILE.name}: {e}"
         )
-        return {}, frozenset(), frozenset(), {}, {}, str(e)
+        return {}, frozenset(), frozenset(), {}, {}, {}, str(e)
 
 
 (
@@ -215,6 +223,7 @@ def _load() -> tuple[
     PROTECTED_IF_FEMALE,
     PRONUNCIATION,
     PRONUNCIATION_IF_FEMALE,
+    PRONUNCIATION_IN_FULL_NAME,
     LOAD_ERROR,
 ) = _load()
 
@@ -232,7 +241,11 @@ def _canonical(core: str) -> str:
 
 
 def _normalize_token(
-    token: str, *, gender: Optional[str] = None, is_given_name: bool = False
+    token: str,
+    *,
+    gender: Optional[str] = None,
+    is_given_name: bool = False,
+    in_full_name: bool = False,
 ) -> tuple[str, tuple[str, ...]]:
     """Returns (token, rules_fired). Punctuation on either edge is set aside
     and restored so that `على،` resolves the same as `على`.
@@ -255,7 +268,9 @@ def _normalize_token(
     tail = token[tail_start:]
 
     fixed, rule = _spell(stripped, gender=gender, is_given_name=is_given_name)
-    spoken, prule = _pronounce(fixed, gender=gender, is_given_name=is_given_name)
+    spoken, prule = _pronounce(
+        fixed, gender=gender, is_given_name=is_given_name, in_full_name=in_full_name
+    )
     rules = tuple(r for r in (rule, prule) if r)
     return head + spoken + tail, rules
 
@@ -292,7 +307,11 @@ def _spell(
 
 
 def _pronounce(
-    text: str, *, gender: Optional[str] = None, is_given_name: bool = False
+    text: str,
+    *,
+    gender: Optional[str] = None,
+    is_given_name: bool = False,
+    in_full_name: bool = False,
 ) -> tuple[str, Optional[str]]:
     """Stage 2 -- how the voice says it, not how the name is spelled.
 
@@ -308,6 +327,14 @@ def _pronounce(
     name alone, which is the safe direction.
     """
     key = _canonical(text)
+    # A name reads differently once another name sits beside it: `نيرة` needs
+    # `نَيِّرة` standing alone but `نَيِّرا` inside a full name. MEASURED, not
+    # theorised -- the voice re-parses the pair. The full-name table is checked
+    # first and falls through to the solo one when it has no entry.
+    if in_full_name:
+        hit = _lookup(key, PRONUNCIATION_IN_FULL_NAME)
+        if hit is not None:
+            return hit, RULE_PRONUNCIATION
     hit = _lookup(key, PRONUNCIATION)
     if hit is not None:
         return hit, RULE_PRONUNCIATION
@@ -348,6 +375,10 @@ def normalize_name(value: Any, gender: Optional[str] = None) -> tuple[Any, dict[
     # Splitting on runs of whitespace and keeping the separators lets the
     # original spacing survive reassembly.
     parts = re.split(r"(\s+)", value)
+    # `user_name` is often one token and `user_name_full` several. Which of the
+    # two pronunciation tables applies depends on that, so it is settled once
+    # for the whole value before any token is rewritten.
+    in_full_name = len([p for p in parts if p.strip(_EDGE_PUNCT).strip()]) > 1
     out = []
     seen_word = False
     for part in parts:
@@ -355,7 +386,10 @@ def normalize_name(value: Any, gender: Optional[str] = None) -> tuple[Any, dict[
             out.append(part)
             continue
         new_part, rules = _normalize_token(
-            part, gender=gender, is_given_name=not seen_word
+            part,
+            gender=gender,
+            is_given_name=not seen_word,
+            in_full_name=in_full_name,
         )
         seen_word = True
         out.append(new_part)

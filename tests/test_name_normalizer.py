@@ -658,3 +658,54 @@ def test_female_conditional_keys_are_clean(data):
     assert [k for k in table if marks & set(k)] == []
     assert set(table) & set(data["overrides"]) == set()
     assert [k for k, v in table.items() if k == v] == []
+
+
+# --------------------------------------------------------------------------
+# Context-dependent pronunciation. MEASURED 2026-09-01: نيرة needs نَيِّرَة
+# standing alone and نَيِّرا once another name sits beside it -- the voice
+# re-parses the pair. `user_name` is often one token and `user_name_full`
+# several, so the same borrower legitimately gets both forms on one call.
+# --------------------------------------------------------------------------
+NAYYERA_IN_FULL = "نَيِّرا"  # نَيِّرا
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("نيرة", NAYYERA_ALIAS),                                   # alone
+    ("نيرة،", NAYYERA_ALIAS + "،"),                            # punctuation is not a name
+    ("نيرة خلاف", NAYYERA_IN_FULL + " " + KHALLAF_ALIAS),      # another name follows
+    ("محمد نيرة", "محمد " + NAYYERA_IN_FULL),                  # another name precedes
+    ("نيره خلاف", NAYYERA_IN_FULL + " " + KHALLAF_ALIAS),      # via the ه->ة repair
+])
+def test_full_name_context_selects_the_other_alias(value, expected):
+    out, _ = nn.normalize_name(value)
+    assert out == expected
+
+
+def test_a_name_without_a_full_name_entry_falls_through_to_the_solo_table():
+    """خلاف has one alias for both contexts. The full-name table must not
+    swallow the lookup when it has no entry for that name."""
+    out, _ = nn.normalize_name("خلاف")
+    assert out == KHALLAF_ALIAS
+    out, _ = nn.normalize_name("محمد خلاف")
+    assert out == "محمد " + KHALLAF_ALIAS
+
+
+def test_the_same_borrower_gets_both_forms_across_fields():
+    """user_name is the short name, user_name_full the full one -- one call,
+    one person, two correct renderings."""
+    raw = {"user_name": "نيرة", "user_name_full": "نيرة خلاف"}
+    out, _ = nn.normalize_dynamic_variables(raw, ["user_name", "user_name_full"])
+    assert out["user_name"] == NAYYERA_ALIAS
+    assert out["user_name_full"] == NAYYERA_IN_FULL + " " + KHALLAF_ALIAS
+
+
+def test_full_name_alias_is_the_exact_code_points_that_were_listened_to(data):
+    assert data["pronunciation_in_full_name"]["نيرة"] == NAYYERA_IN_FULL
+
+
+def test_full_name_table_keys_are_clean(data):
+    marks = set("ًٌٍَُِّْـٰ")
+    table = data.get("pronunciation_in_full_name", {})
+    assert [k for k in table if marks & set(k)] == []
+    assert set(table) & set(data["overrides"]) == set()
+    assert [k for k, v in table.items() if k == v] == []
